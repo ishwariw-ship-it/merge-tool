@@ -64,8 +64,9 @@ COMBINE_SAFE_FILES = {".env.example", ".gitignore", "README.md"}
 
 def bucket_conflict(worktree, path):
     # decide whether a conflicted file can be resolved by machine or needs a person
+    # resolution says how to fix it: "combine", "take_either", or None (needs a person)
     if os.path.basename(path) in COMBINE_SAFE_FILES:
-        return "machine", "config file, safe to combine"
+        return "machine", "config file, safe to combine", "combine"
 
     ours = subprocess.run(
         ["git", "-C", worktree, "show", f":2:{path}"], capture_output=True, text=True
@@ -74,9 +75,36 @@ def bucket_conflict(worktree, path):
         ["git", "-C", worktree, "show", f":3:{path}"], capture_output=True, text=True
     )
     if ours.stdout == theirs.stdout:
-        return "machine", "both sides made the same change"
+        return "machine", "both sides made the same change", "take_either"
 
-    return "human", "both sides changed it differently, needs a person"
+    return "human", "both sides changed it differently, needs a person", None
+
+
+def apply_resolution(worktree, path, resolution):
+    # write the resolved content for one conflicted file and stage it
+    ours = subprocess.run(
+        ["git", "-C", worktree, "show", f":2:{path}"], capture_output=True, text=True
+    ).stdout
+
+    if resolution == "take_either":
+        content = ours
+    else:
+        # combine: ours' lines first, then theirs' lines that aren't already present
+        theirs = subprocess.run(
+            ["git", "-C", worktree, "show", f":3:{path}"], capture_output=True, text=True
+        ).stdout
+        combined_lines = ours.splitlines()
+        for line in theirs.splitlines():
+            if line not in combined_lines:
+                combined_lines.append(line)
+        content = "\n".join(combined_lines)
+        if combined_lines:
+            content += "\n"
+
+    with open(os.path.join(worktree, path), "w") as f:
+        f.write(content)
+
+    subprocess.run(["git", "-C", worktree, "add", path], capture_output=True, text=True)
 
 
 def sort_conflicts(repo, target, branches, branch_info):
@@ -121,16 +149,43 @@ def sort_conflicts(repo, target, branches, branch_info):
                     text=True,
                 )
                 conflicted_files = [l for l in conflicted.stdout.splitlines() if l]
-                report = []
+                entries = []
                 for path in conflicted_files:
-                    bucket, comment = bucket_conflict(worktree, path)
-                    report.append({"file": path, "bucket": bucket, "comment": comment})
-                result[branch] = report
-                subprocess.run(
-                    ["git", "-C", worktree, "merge", "--abort"],
-                    capture_output=True,
-                    text=True,
-                )
+                    bucket, comment, resolution = bucket_conflict(worktree, path)
+                    entries.append(
+                        {"file": path, "bucket": bucket, "comment": comment, "resolution": resolution}
+                    )
+
+                all_machine = all(e["bucket"] == "machine" for e in entries)
+
+                if all_machine:
+                    # every conflict is safe to auto-resolve, so fix them all and commit
+                    for e in entries:
+                        apply_resolution(worktree, e["file"], e["resolution"])
+                    subprocess.run(
+                        ["git", "-C", worktree, *ident, "commit", "--no-edit", "-q"],
+                        capture_output=True,
+                        text=True,
+                    )
+                    applied = True
+                else:
+                    # at least one needs a person, so abort - all or nothing per branch
+                    subprocess.run(
+                        ["git", "-C", worktree, "merge", "--abort"],
+                        capture_output=True,
+                        text=True,
+                    )
+                    applied = False
+
+                result[branch] = [
+                    {
+                        "file": e["file"],
+                        "bucket": e["bucket"],
+                        "comment": e["comment"],
+                        "applied": applied,
+                    }
+                    for e in entries
+                ]
     finally:
         # always remove the worktree and temp branch
         subprocess.run(
@@ -175,7 +230,10 @@ def main():
             print(f"{branch}: skipped (no shared history)")
         elif files:
             for f in files:
-                print(f"{branch}: {f['file']} -> {f['bucket']} ({f['comment']})")
+                print(
+                    f"{branch}: {f['file']} -> {f['bucket']}, applied={f['applied']} "
+                    f"({f['comment']})"
+                )
         else:
             print(f"{branch}: clean")
 
