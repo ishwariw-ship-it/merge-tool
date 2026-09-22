@@ -2,9 +2,10 @@
 
 A small script for scoping out a merge before you do it. It looks at a set of
 branches against a target branch, does a trial merge in a throwaway worktree
-(never touching your real branches), and sorts any conflicts into two
-buckets: `machine` (safe to auto-resolve) and `human` (needs a person to look
-at it).
+(never touching your real branches), sorts any conflicts into two buckets —
+`machine` (safe to auto-resolve) and `human` (needs a person to look at it) —
+and auto-resolves a branch's conflicts when every single one of them is
+machine-safe.
 
 ## What it does
 
@@ -14,12 +15,16 @@ at it).
 2. **sort_conflicts** — sets up a temporary git worktree at the target's tip
    and merges each branch into it one at a time (`git merge --no-ff
    --no-commit`). Clean merges get committed so later branches are checked
-   against the combined result. Conflicting merges are aborted; nothing is
-   ever left half-merged. Branches with no shared history are skipped.
+   against the combined result. Branches with no shared history are skipped.
 3. **bucket_conflict** — for each conflicted file, decides `machine` if it's
    one of a small set of config files that are safe to combine
    (`.env.example`, `.gitignore`, `README.md`) or if both sides made the
    identical change, otherwise `human`.
+4. **Auto-resolve, all-or-nothing** — if every conflicted file in a branch's
+   merge attempt is `machine`, the tool fixes them all (combines config
+   files' lines, or takes either side when the content is identical) and
+   commits the merge. If even one file is `human`, nothing is applied and
+   the whole merge is aborted — never a half-resolved merge.
 
 The worktree and any temp branches are always cleaned up, even on error.
 
@@ -42,8 +47,9 @@ python3 merge_tool.py /path/to/repo main feat/a feat/b feat/c
   and overlap, keyed by branch name.
 - A printed report on stdout from `sort_conflicts`: for each branch, either
   `clean`, `skipped (no shared history)`, or one line per conflicted file
-  with its bucket (`machine`/`human`) and a short reason. This report is not
-  currently written to a file, just printed.
+  with its bucket (`machine`/`human`), whether it was `applied`, and a short
+  reason. This report is not currently written to a file, just printed —
+  there's no `report.jsonl` yet.
 
 ## Test result
 
