@@ -1,4 +1,5 @@
 import argparse
+import difflib
 import json
 import os
 import shutil
@@ -107,27 +108,54 @@ def apply_resolution(worktree, path, resolution):
     subprocess.run(["git", "-C", worktree, "add", path], capture_output=True, text=True)
 
 
-def sort_conflicts(repo, target, branches, branch_info):
-    result = {}
+def conflict_diff(worktree, path):
+    # unified diff between ours (:2:) and theirs (:3:) for a human-bucket conflict
+    ours = subprocess.run(
+        ["git", "-C", worktree, "show", f":2:{path}"], capture_output=True, text=True
+    ).stdout
+    theirs = subprocess.run(
+        ["git", "-C", worktree, "show", f":3:{path}"], capture_output=True, text=True
+    ).stdout
+    lines = difflib.unified_diff(
+        ours.splitlines(keepends=True),
+        theirs.splitlines(keepends=True),
+        fromfile="ours",
+        tofile="theirs",
+    )
+    return "".join(lines)
 
+
+def new_chain_worktree(repo, start_point, tag):
+    # a fresh throwaway worktree + branch, checked out at start_point
     tmp_dir = tempfile.mkdtemp(prefix="merge_tool_")
     worktree = os.path.join(tmp_dir, "wt")
-    temp_branch = f"merge-tool-tmp-{os.getpid()}"
+    branch_name = f"merge-tool-tmp-{os.getpid()}-{tag}"
+    subprocess.run(
+        ["git", "-C", repo, "worktree", "add", "-b", branch_name, worktree, start_point],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return tmp_dir, worktree, branch_name
+
+
+def sort_conflicts(repo, target, branches, branch_info):
+    result = {}
     ident = ["-c", "user.name=merge-tool", "-c", "user.email=merge-tool@localhost"]
 
-    try:
-        # throwaway worktree at the target's tip
-        subprocess.run(
-            ["git", "-C", repo, "worktree", "add", "-b", temp_branch, worktree, target],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
+    chain_idx = 0
+    tmp_dir, worktree, temp_branch = new_chain_worktree(repo, target, chain_idx)
 
+    try:
         for branch in branches:
             if not branch_info[branch]["shares_history"]:
                 result[branch] = None
                 continue
+
+            # the chain's current tip, in case this branch gets stuck and we need to resume from here
+            last_good = subprocess.run(
+                ["git", "-C", worktree, "rev-parse", "HEAD"], capture_output=True, text=True
+            ).stdout.strip()
 
             merge = subprocess.run(
                 ["git", "-C", worktree, "merge", "--no-ff", "--no-commit", branch],
@@ -142,52 +170,69 @@ def sort_conflicts(repo, target, branches, branch_info):
                     text=True,
                 )
                 result[branch] = []
-            else:
-                conflicted = subprocess.run(
-                    ["git", "-C", worktree, "diff", "--name-only", "--diff-filter=U"],
+                continue
+
+            conflicted = subprocess.run(
+                ["git", "-C", worktree, "diff", "--name-only", "--diff-filter=U"],
+                capture_output=True,
+                text=True,
+            )
+            conflicted_files = [l for l in conflicted.stdout.splitlines() if l]
+            entries = []
+            for path in conflicted_files:
+                bucket, comment, resolution = bucket_conflict(worktree, path)
+                entries.append(
+                    {"file": path, "bucket": bucket, "comment": comment, "resolution": resolution}
+                )
+
+            # machine files always get fixed and staged, regardless of what else is left
+            for e in entries:
+                if e["bucket"] == "machine":
+                    apply_resolution(worktree, e["file"], e["resolution"])
+
+            human_left = any(e["bucket"] == "human" for e in entries)
+
+            if not human_left:
+                # everything was machine-safe: commit and keep going
+                subprocess.run(
+                    ["git", "-C", worktree, *ident, "commit", "--no-edit", "-q"],
                     capture_output=True,
                     text=True,
                 )
-                conflicted_files = [l for l in conflicted.stdout.splitlines() if l]
-                entries = []
-                for path in conflicted_files:
-                    bucket, comment, resolution = bucket_conflict(worktree, path)
-                    entries.append(
-                        {"file": path, "bucket": bucket, "comment": comment, "resolution": resolution}
-                    )
-
-                all_machine = all(e["bucket"] == "machine" for e in entries)
-
-                if all_machine:
-                    # every conflict is safe to auto-resolve, so fix them all and commit
-                    for e in entries:
-                        apply_resolution(worktree, e["file"], e["resolution"])
-                    subprocess.run(
-                        ["git", "-C", worktree, *ident, "commit", "--no-edit", "-q"],
-                        capture_output=True,
-                        text=True,
-                    )
-                    applied = True
-                else:
-                    # at least one needs a person, so abort - all or nothing per branch
-                    subprocess.run(
-                        ["git", "-C", worktree, "merge", "--abort"],
-                        capture_output=True,
-                        text=True,
-                    )
-                    applied = False
-
                 result[branch] = [
-                    {
-                        "file": e["file"],
-                        "bucket": e["bucket"],
-                        "comment": e["comment"],
-                        "applied": applied,
-                    }
+                    {"file": e["file"], "bucket": e["bucket"], "comment": e["comment"], "applied": True}
                     for e in entries
                 ]
+                continue
+
+            # some files still need a person: leave this worktree as-is for review, don't commit
+            review_branch = f"mergetool-review-{branch}"
+            subprocess.run(
+                ["git", "-C", worktree, "branch", "-m", review_branch],
+                capture_output=True,
+                text=True,
+            )
+
+            report = []
+            for e in entries:
+                item = {
+                    "file": e["file"],
+                    "bucket": e["bucket"],
+                    "comment": e["comment"],
+                    "applied": e["bucket"] == "machine",
+                    "review_path": worktree,
+                }
+                if e["bucket"] == "human":
+                    item["diff"] = conflict_diff(worktree, e["file"])
+                report.append(item)
+            result[branch] = report
+
+            # this worktree is now kept for review - start a fresh one from the last good
+            # commit so a stuck branch doesn't block the rest of the list
+            chain_idx += 1
+            tmp_dir, worktree, temp_branch = new_chain_worktree(repo, last_good, chain_idx)
     finally:
-        # always remove the worktree and temp branch
+        # remove only the current (non-kept) worktree and its branch
         subprocess.run(
             ["git", "-C", repo, "worktree", "remove", "--force", worktree],
             capture_output=True,
@@ -234,6 +279,9 @@ def main():
                     f"{branch}: {f['file']} -> {f['bucket']}, applied={f['applied']} "
                     f"({f['comment']})"
                 )
+            review_path = files[0].get("review_path")
+            if review_path:
+                print(f"{branch}: needs review, worktree kept at {review_path}")
         else:
             print(f"{branch}: clean")
 
