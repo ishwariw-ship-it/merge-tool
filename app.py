@@ -14,28 +14,76 @@ COLORS = {
 }
 
 
+def git(repo, *args):
+    # run a git command in the repo and return the finished process
+    return subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True)
+
+
 def check_inputs(repo, target, branches):
-    # return an error message, or None if the repo and every ref look fine
+    # return an error message, or None if the repo and every branch look fine
     if not os.path.isdir(repo):
         return f"Repo path does not exist: {repo}"
-    inside = subprocess.run(
-        ["git", "-C", repo, "rev-parse", "--is-inside-work-tree"],
-        capture_output=True,
-        text=True,
-    )
-    if inside.returncode != 0:
+    if git(repo, "rev-parse", "--is-inside-work-tree").returncode != 0:
         return f"Not a git repository: {repo}"
     if not branches:
         return "Enter at least one branch name."
-    for ref in [target] + branches:
-        found = subprocess.run(
-            ["git", "-C", repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
-            capture_output=True,
-            text=True,
-        )
-        if found.returncode != 0:
-            return f"Branch does not exist: {ref}"
+    for name in [target] + branches:
+        if git(repo, "rev-parse", "--verify", "--quiet", f"{name}^{{commit}}").returncode != 0:
+            return f"Branch does not exist: {name}"
     return None
+
+
+def find_leftovers(repo, branches):
+    # find old mergetool-review-<branch> branches/worktrees
+    # returns {review branch: worktree path, or None if it has no worktree}
+    worktrees = {}
+    path = None
+    for line in git(repo, "worktree", "list", "--porcelain").stdout.splitlines():
+        if line.startswith("worktree "):
+            path = line[len("worktree "):]
+        elif line.startswith("branch refs/heads/"):
+            worktrees[line[len("branch refs/heads/"):]] = path
+
+    leftovers = {}
+    for branch in branches:
+        review = f"mergetool-review-{branch}"
+        has_branch = git(repo, "branch", "--list", review).stdout.strip()
+        if has_branch or review in worktrees:
+            leftovers[review] = worktrees.get(review)
+    return leftovers
+
+
+def remove_leftovers(repo, leftovers):
+    # delete the old worktrees and branches, return a list of what was removed
+    removed = []
+    kept = set()
+    for review, path in leftovers.items():
+        if not path:
+            continue
+        # any output means the person edited files there: keep worktree and branch
+        status = git(path, "status", "--porcelain")
+        if status.returncode != 0:
+            st.warning(f"Could not check {review}, not removed: {status.stderr.strip()}")
+            kept.add(review)
+        elif status.stdout.strip():
+            st.warning(f"{review} has unsaved edits, not removed — finish or discard them first.")
+            kept.add(review)
+        else:
+            # no --force: git itself refuses if the worktree is somehow dirty
+            result = git(repo, "worktree", "remove", path)
+            if result.returncode != 0:
+                st.warning(f"Could not remove {review}: {result.stderr.strip()}")
+                kept.add(review)
+            else:
+                removed.append(f"worktree {path}")
+    # forget worktrees already deleted on disk, so their branches can be deleted
+    git(repo, "worktree", "prune")
+    for review in leftovers:
+        if review in kept:
+            continue
+        git(repo, "branch", "-D", review)
+        removed.append(f"branch {review}")
+    return removed
 
 
 def status_of(files):
@@ -62,15 +110,16 @@ def color_status(value):
 
 
 def show_overview(data):
-    rows = [
-        {
-            "branch": branch,
-            "shares history": info["shares_history"],
-            "files touched": len(info["files_touched"]),
-            "overlaps with": ", ".join(info["overlap"]) or "-",
-        }
-        for branch, info in data.items()
-    ]
+    rows = []
+    for branch, info in data.items():
+        rows.append(
+            {
+                "branch": branch,
+                "shares history": info["shares_history"],
+                "files touched": len(info["files_touched"]),
+                "overlaps with": ", ".join(info["overlap"]) or "-",
+            }
+        )
     st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
 
@@ -96,67 +145,18 @@ def show_branch_details(conflicts):
         if status not in ("auto-fixed", "needs human"):
             continue
         with st.expander(f"{branch} - {status}"):
-            for f in files:
-                if f["bucket"] == "machine":
-                    st.write(f"Auto-fixed `{f['file']}`: {f['comment']}")
-            humans = [f for f in files if f["bucket"] == "human"]
-            if humans:
-                st.write(f"Review worktree kept at: `{humans[0]['review_path']}`")
-            for f in humans:
+            machine = [f for f in files if f["bucket"] == "machine"]
+            human = [f for f in files if f["bucket"] == "human"]
+            for f in machine:
+                st.write(f"Auto-fixed `{f['file']}`: {f['comment']}")
+            if human:
+                st.write(f"Review worktree kept at: `{human[0]['review_path']}`")
+            for f in human:
                 st.write(f"Needs human: `{f['file']}` ({f['comment']})")
                 # the kept worktree holds the file with conflict markers
                 path = os.path.join(f["review_path"], f["file"])
                 with open(path, errors="replace") as fh:
                     st.code(fh.read())
-
-
-def clean_review(repo, branches, clean):
-    # find leftover mergetool-review-<branch> worktrees/branches; remove them if clean is on
-    # returns (error, removed): error if leftovers exist and clean is off
-    listing = subprocess.run(
-        ["git", "-C", repo, "worktree", "list", "--porcelain"],
-        capture_output=True,
-        text=True,
-    ).stdout
-    # map branch name -> worktree path
-    worktrees = {}
-    path = None
-    for line in listing.splitlines():
-        if line.startswith("worktree "):
-            path = line[len("worktree "):]
-        elif line.startswith("branch refs/heads/"):
-            worktrees[line[len("branch refs/heads/"):]] = path
-
-    found = []
-    for branch in branches:
-        review = f"mergetool-review-{branch}"
-        exists = subprocess.run(
-            ["git", "-C", repo, "branch", "--list", review], capture_output=True, text=True
-        ).stdout.strip()
-        if exists or review in worktrees:
-            found.append(review)
-
-    if found and not clean:
-        names = ", ".join(found)
-        return f"Old review branches exist ({names}). Tick 'Clean up previous review worktrees'.", []
-    if not clean:
-        return None, []
-
-    removed = []
-    for review in found:
-        if review in worktrees:
-            subprocess.run(
-                ["git", "-C", repo, "worktree", "remove", "--force", worktrees[review]],
-                capture_output=True,
-                text=True,
-            )
-            removed.append(f"worktree {worktrees[review]}")
-    # drop entries for worktrees already deleted on disk, so their branches can be deleted
-    subprocess.run(["git", "-C", repo, "worktree", "prune"], capture_output=True, text=True)
-    for review in found:
-        subprocess.run(["git", "-C", repo, "branch", "-D", review], capture_output=True, text=True)
-        removed.append(f"branch {review}")
-    return None, removed
 
 
 def main():
@@ -167,7 +167,11 @@ def main():
         repo = st.text_input("Repo path")
         target = st.text_input("Target branch", value="main")
         names = st.text_area("Branch names (one per line)")
-        clean = st.checkbox("Clean up previous review worktrees")
+        clean = st.checkbox(
+            "Clean up previous review worktrees",
+            help="Review copies from earlier runs may contain a fix someone started. "
+            "Ticking this deletes them and runs fresh.",
+        )
         run = st.button("Run")
 
     if not run:
@@ -183,12 +187,17 @@ def main():
         st.error(error)
         return
 
-    error, removed = clean_review(repo, branches, clean)
-    if error:
-        st.error(error)
+    leftovers = find_leftovers(repo, branches)
+    if leftovers and not clean:
+        st.error(
+            f"A review copy from an earlier run still exists for: {', '.join(leftovers)}. "
+            "It may contain a fix someone started. Ticking 'Clean up previous review "
+            "worktrees' will delete it and run fresh."
+        )
         return
     if clean:
-        st.write("Cleaned up: " + (", ".join(removed) if removed else "nothing to clean"))
+        removed = remove_leftovers(repo, leftovers)
+        st.write("Cleaned up: " + (", ".join(removed) or "nothing to clean"))
 
     with st.spinner("Inspecting and trial-merging branches..."):
         data = understand_branches(repo, target, branches)
