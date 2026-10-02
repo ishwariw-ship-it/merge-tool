@@ -23,8 +23,14 @@ def call_llm(prompt):
         reply = client.chat.completions.create(
             model=os.environ.get("OPENAI_MODEL") or "gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            max_tokens=8000,
         )
-        return reply.choices[0].message.content
+        choice = reply.choices[0]
+        if choice.finish_reason == "length":
+            print("AI: reply was cut off (file too long)")
+            return None
+        return choice.message.content
     except Exception as e:
         # only the error type: some messages echo part of the key
         print(f"AI: model call failed ({type(e).__name__}).")
@@ -73,30 +79,41 @@ Their commit message: {their_commit_msg}
 === THEIRS ({their_branch}) ===
 {theirs}
 
-Reply with JSON only, no markdown, with exactly these keys:
+Reply with JSON only. Never wrap the JSON in markdown fences. Put the merged file
+content in "merged" as a normal JSON string (escape newlines and quotes).
+Use exactly these keys:
 "explanation": what each side changed and why they clash, 3-5 lines
 "risk_ours": what breaks if we keep only our side
 "risk_theirs": what breaks if we keep only their side
 "merged": the full proposed file content keeping both changes, no conflict markers
 "confidence": "low", "medium" or "high"
 """
-    text = call_llm(prompt)
-    if text is None:
-        return {"ok": False, "raw_text": None}
+    # try the call twice: a bad reply is often fine the second time
+    for attempt in (1, 2):
+        text = call_llm(prompt)
+        if text is None:
+            return {"ok": False, "raw_text": None}
 
-    # models often wrap JSON in ``` fences, strip them before parsing
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.strip("`").removeprefix("json").strip()
-    try:
-        data = json.loads(cleaned)
-        result = {
-            key: data[key]
-            for key in ("explanation", "risk_ours", "risk_theirs", "merged", "confidence")
-        }
-    except (ValueError, KeyError, TypeError):
-        print("AI: could not read the model's reply as JSON.")
-        return {"ok": False, "raw_text": text}
+        # models often wrap JSON in ``` fences, strip them before parsing
+        cleaned = text.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.strip("`").removeprefix("json").strip()
+        try:
+            try:
+                data = json.loads(cleaned)
+            except ValueError:
+                # last try: keep only the text from the first { to the last }
+                data = json.loads(cleaned[cleaned.index("{") : cleaned.rindex("}") + 1])
+            # a missing key becomes an empty string instead of a failure
+            result = {
+                key: data.get(key, "")
+                for key in ("explanation", "risk_ours", "risk_theirs", "merged", "confidence")
+            }
+        except (ValueError, AttributeError) as e:
+            print(f"AI: could not read the model's reply as JSON ({type(e).__name__}: {e}).")
+            continue
 
-    result["ok"] = True
-    return result
+        result["ok"] = True
+        return result
+
+    return {"ok": False, "raw_text": text}

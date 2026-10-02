@@ -2,3 +2,5 @@
 __pycache__/
 branches.json
 .venv/
+ai_replay_results.jsonl
+replay_review/
