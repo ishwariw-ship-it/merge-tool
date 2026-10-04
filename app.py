@@ -1,5 +1,7 @@
 import os
+import shutil
 import subprocess
+import tempfile
 
 import pandas as pd
 import streamlit as st
@@ -120,7 +122,17 @@ def show_overview(data):
                 "overlaps with": ", ".join(info["overlap"]) or "-",
             }
         )
-    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    st.dataframe(
+        pd.DataFrame(rows),
+        hide_index=True,
+        width="stretch",
+        column_config={
+            "branch": st.column_config.TextColumn("Branch"),
+            "shares history": st.column_config.CheckboxColumn("Shares history"),
+            "files touched": st.column_config.NumberColumn("Files touched", format="%d"),
+            "overlaps with": st.column_config.TextColumn("Overlaps with"),
+        },
+    )
 
 
 def show_results(conflicts):
@@ -135,87 +147,459 @@ def show_results(conflicts):
                 "reason": reason_of(status, files),
             }
         )
+    # the status column is coloured text, so it reads like a badge
     table = pd.DataFrame(rows).style.map(color_status, subset=["status"])
-    st.dataframe(table, hide_index=True, use_container_width=True)
+    st.dataframe(
+        table,
+        hide_index=True,
+        width="stretch",
+        column_config={
+            "branch": st.column_config.TextColumn("Branch"),
+            "status": st.column_config.TextColumn("Status", width="small"),
+            "files": st.column_config.TextColumn("Files"),
+            "reason": st.column_config.TextColumn("Reason"),
+        },
+    )
 
 
-def show_branch_details(conflicts):
-    for branch, files in conflicts.items():
-        status = status_of(files)
-        if status not in ("auto-fixed", "needs human"):
-            continue
-        with st.expander(f"{branch} - {status}"):
-            machine = [f for f in files if f["bucket"] == "machine"]
-            human = [f for f in files if f["bucket"] == "human"]
-            for f in machine:
+def show_metrics(conflicts):
+    # one tile per status, in a row
+    statuses = [status_of(files) for files in conflicts.values()]
+    tiles = [("Clean", "clean"), ("Auto-fixed", "auto-fixed"), ("Needs human", "needs human"), ("Skipped", "skipped")]
+    for column, (label, status) in zip(st.columns(4), tiles):
+        column.metric(label, statuses.count(status))
+
+
+def show_stage(worktree, stage, path):
+    # one side of a conflict (1 = base, 2 = ours, 3 = theirs), or None if that stage is missing
+    result = subprocess.run(
+        ["git", "-C", worktree, "show", f":{stage}:{path}"],
+        capture_output=True,
+        text=True,
+        errors="replace",
+    )
+    return result.stdout if result.returncode == 0 else None
+
+
+
+def load_versions(worktree, path):
+    # base / ours / theirs from the conflict stages (None = that stage is missing)
+    return [show_stage(worktree, stage, path) for stage in (1, 2, 3)]
+
+
+def show_three_way(versions):
+    # base / ours / theirs side by side
+    if all(v is None for v in versions):
+        # stages disappear once the file is resolved and staged
+        st.info("Three-way view not available: this file is no longer in a conflicted state.")
+        return
+    titles = ["Base", "Ours (target)", "Theirs (branch)"]
+    for column, title, text in zip(st.columns(3), titles, versions):
+        with column:
+            st.markdown(f"**{title}**")
+            # add/add conflicts have no base, so a missing stage means no file on that side
+            st.code(text if text is not None else "(file did not exist)")
+
+
+def show_raw_markers(worktree, path):
+    # the kept worktree holds the file with conflict markers
+    try:
+        with open(os.path.join(worktree, path), errors="replace") as fh:
+            st.code(fh.read())
+    except OSError as e:
+        st.warning(f"Could not read {path}: {e.strerror}")
+
+
+def last_subject(worktree, ref):
+    # subject line of the last commit on ref, or "unknown"
+    result = git(worktree, "log", "-1", "--format=%s", ref)
+    return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else "unknown"
+
+
+def ask_ai(worktree, target, branch, path, versions):
+    # call the AI helper; any failure comes back as ok=False, never an exception
+    try:
+        from ai_resolve import explain_conflict
+
+        base, ours, theirs = (v or "" for v in versions)
+        return explain_conflict(
+            path,
+            base,
+            ours,
+            theirs,
+            target,
+            branch,
+            last_subject(worktree, target),
+            last_subject(worktree, branch),
+        )
+    except Exception as e:
+        return {"ok": False, "reason": f"could not run the AI helper ({type(e).__name__})"}
+
+
+def failure_reason(result):
+    # short reason for a failed AI call (ai_resolve prints the details in the terminal)
+    if result.get("reason"):
+        return result["reason"]
+    if result.get("raw_text") is None:
+        return "no reply from the model (check OPENAI_API_KEY and the connection)"
+    return "the reply was not valid JSON"
+
+
+def show_ai_result(result):
+    # the AI's answer in a bordered box, in a fixed order
+    with st.container(border=True):
+        if not result.get("ok"):
+            st.error(f"AI unavailable: {failure_reason(result)}")
+            return
+
+        st.markdown("**Explanation**")
+        st.write(str(result.get("explanation", "")))
+        col_ours, col_theirs = st.columns(2)
+        col_ours.info(f"**If we keep only ours**\n\n{result.get('risk_ours', '')}")
+        col_theirs.info(f"**If we keep only theirs**\n\n{result.get('risk_theirs', '')}")
+
+        if result.get("recommend"):
+            st.markdown(f":blue-background[**AI recommends: {result['recommend']}**]")
+        if result.get("port_from_other"):
+            st.markdown("**Worth porting from the other side**")
+            st.markdown("\n".join(f"- {item}" for item in result["port_from_other"]))
+
+        merged = result.get("merged", "")
+        if not merged:
+            st.info("AI did not propose a merged file — decide by hand using the explanation above.")
+            return
+        st.markdown("**Proposed merged file**")
+        checks = result.get("checks", [])
+        if checks:
+            st.error("\n".join(f"- {problem}" for problem in checks))
+        else:
+            st.success("passed checks")
+        st.code(merged)
+
+
+def is_review_worktree(worktree):
+    # only ever write in a worktree whose branch is a mergetool-review-* branch
+    head = git(worktree, "symbolic-ref", "--short", "HEAD")
+    return head.returncode == 0 and head.stdout.strip().startswith("mergetool-review-")
+
+
+def write_atomic(worktree, path, text):
+    # write to a temp file next to the target, then rename; returns an error message or None
+    root = os.path.realpath(worktree)
+    full = os.path.realpath(os.path.join(root, path))
+    if not full.startswith(root + os.sep):
+        return f"{path} is outside the review worktree, nothing written."
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(full), prefix=".merge-tool-")
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        if os.path.exists(full):
+            shutil.copymode(full, tmp)
+        else:
+            os.chmod(tmp, 0o644)
+        os.replace(tmp, full)
+        return None
+    except OSError as e:
+        if tmp and os.path.exists(tmp):
+            os.unlink(tmp)
+        return f"Could not write {path}: {e.strerror}"
+
+
+def write_and_stage(worktree, path, text, versions, key):
+    # check, write and `git add` one file in the review worktree; returns an error or None
+    try:
+        from ai_resolve import check_merged
+    except Exception:
+        return "Could not load the checker, nothing written."
+    problems = check_merged(path, text)
+    if problems:
+        return "Not written:\n" + "\n".join(f"- {p}" for p in problems)
+    if not is_review_worktree(worktree):
+        return "This is not a review worktree, nothing written."
+    error = write_atomic(worktree, path, text)
+    if error:
+        return error
+    added = git(worktree, "add", "--", path)
+    if added.returncode != 0:
+        lines = added.stderr.strip().splitlines()
+        return f"Wrote {path} but git add failed: {lines[0] if lines else 'unknown error'}"
+    st.session_state[f"res:{key}"] = "resolved"
+    # the conflict stages are gone once staged, so keep the view we showed
+    st.session_state[f"view:{key}"] = versions
+    return None
+
+
+def show_editor(worktree, path, merged, versions, key):
+    # the proposed file in a text box; Save checks, writes and stages it
+    text = st.text_area("Proposed file (editable)", value=merged, height=400, key=f"text:{key}")
+    if st.button("Save", key=f"save:{key}"):
+        error = write_and_stage(worktree, path, text, versions, key)
+        if error:
+            st.error(error)
+        else:
+            st.rerun()
+
+
+def show_decision(worktree, path, result, versions, key):
+    # Accept / Edit / Reject for a proposed merged file
+    state = st.session_state.get(f"res:{key}")
+    if state == "resolved":
+        st.success("Resolved — staged in the review worktree")
+        return
+    if state == "rejected":
+        st.caption("Rejected — file still has conflict markers; fix it by hand in the review worktree.")
+        return
+
+    accept, edit, reject, _ = st.columns([1, 1, 1, 5])
+    # Accept needs a clean check result
+    if accept.button("Accept", key=f"accept:{key}", type="primary", disabled=bool(result.get("checks"))):
+        error = write_and_stage(worktree, path, result["merged"], versions, key)
+        if error:
+            st.error(error)
+        else:
+            st.rerun()
+    if edit.button("Edit", key=f"edit:{key}"):
+        st.session_state[f"editing:{key}"] = True
+    if reject.button("Reject", key=f"reject:{key}"):
+        st.session_state[f"res:{key}"] = "rejected"
+        st.rerun()
+    if st.session_state.get(f"editing:{key}"):
+        show_editor(worktree, path, result["merged"], versions, key)
+
+
+def ask_about(question, path, versions, target, branch):
+    # the AI's plain-text answer to a free-form question, or None if the call failed
+    try:
+        from ai_resolve import ask_question
+
+        base, ours, theirs = (v or "" for v in versions)
+        return ask_question(question, path, base, ours, theirs, target, branch)
+    except Exception:
+        return None
+
+
+def show_question(path, versions, target, branch, key):
+    # free-form question box; the last question and answer are kept per branch + file
+    st.markdown("**Ask a question about this conflict**")
+    question = st.text_input(
+        "Question",
+        placeholder="e.g. what breaks if I take only their side?",
+        key=f"q:{key}",
+        label_visibility="collapsed",
+    )
+    if st.button("Ask", key=f"qask:{key}"):
+        if not question.strip():
+            st.warning("Type a question first.")
+        else:
+            with st.spinner("Asking AI..."):
+                answer = ask_about(question.strip(), path, versions, target, branch)
+            st.session_state[f"qa:{key}"] = {"question": question.strip(), "answer": answer}
+    saved = st.session_state.get(f"qa:{key}")
+    if saved:
+        with st.container(border=True):
+            st.markdown(f"**Q:** {saved['question']}")
+            if saved["answer"] is None:
+                st.error("AI unavailable")
+            else:
+                st.write(saved["answer"])
+
+
+def show_ai_section(worktree, target, branch, path, versions):
+    # "Ask AI" button; the answer is cached per branch + file so reruns don't call the API
+    key = f"{branch}:{path}"
+    if f"ai:{key}" not in st.session_state:
+        if not st.button("Ask AI about this conflict", key=f"ask:{key}", type="primary"):
+            return
+        with st.spinner("Asking AI..."):
+            st.session_state[f"ai:{key}"] = ask_ai(worktree, target, branch, path, versions)
+    result = st.session_state[f"ai:{key}"]
+    show_ai_result(result)
+    if result.get("ok") and result.get("merged"):
+        show_decision(worktree, path, result, versions, key)
+    show_question(path, versions, target, branch, key)
+    if st.session_state.get(f"res:{key}") != "resolved" and st.button("Ask again", key=f"again:{key}"):
+        # a new answer starts fresh: forget any earlier decision and edits
+        for prefix in ("ai:", "res:", "editing:", "text:"):
+            st.session_state.pop(f"{prefix}{key}", None)
+        st.rerun()
+
+
+def show_human_file(f, target, branch):
+    # one conflicted file: side-by-side / raw tabs, then the AI helper
+    st.markdown(f"**`{f['file']}`** — {f['comment']}")
+    key = f"{branch}:{f['file']}"
+    versions = st.session_state.get(f"view:{key}")
+    if versions is None:
+        versions = load_versions(f["review_path"], f["file"])
+    side, raw = st.tabs(["Side by side", "Raw markers"])
+    with side:
+        show_three_way(versions)
+    with raw:
+        show_raw_markers(f["review_path"], f["file"])
+    if not all(v is None for v in versions):
+        show_ai_section(f["review_path"], target, branch, f["file"], versions)
+
+
+def show_branch_card(branch, files, target):
+    # one bordered card per conflicted branch
+    status = status_of(files)
+    human = [f for f in files if f["bucket"] == "human"]
+    with st.container(border=True):
+        names = ", ".join(f"`{f['file']}`" for f in files)
+        st.markdown(f"**{branch}** — {status}: {names}")
+        for f in files:
+            if f["bucket"] == "machine":
                 st.write(f"Auto-fixed `{f['file']}`: {f['comment']}")
-            if human:
-                st.write(f"Review worktree kept at: `{human[0]['review_path']}`")
-            for f in human:
-                st.write(f"Needs human: `{f['file']}` ({f['comment']})")
-                # the kept worktree holds the file with conflict markers
-                path = os.path.join(f["review_path"], f["file"])
-                with open(path, errors="replace") as fh:
-                    st.code(fh.read())
+        if human:
+            st.caption(f"Review worktree kept at: {human[0]['review_path']}")
+        for f in human:
+            show_human_file(f, target, branch)
 
 
-def main():
-    st.set_page_config(page_title="Merge tool", layout="wide")
-    st.title("Merge tool")
+def show_conflicts(conflicts, target):
+    # needs-human branches first, then auto-fixed ones
+    order = {"needs human": 0, "auto-fixed": 1}
+    cards = [(b, fs) for b, fs in conflicts.items() if status_of(fs) in order]
+    if not cards:
+        st.info("No conflicts to review.")
+    for branch, files in sorted(cards, key=lambda c: order[status_of(c[1])]):
+        show_branch_card(branch, files, target)
 
+
+def load_branches(repo):
+    # local branch names for the repo, returns (names, error)
+    repo = os.path.expanduser(repo.strip())
+    if not os.path.isdir(repo):
+        return None, f"Repo path does not exist: {repo}"
+    result = git(repo, "branch", "--format=%(refname:short)")
+    if result.returncode != 0:
+        lines = result.stderr.strip().splitlines()
+        return None, "Could not list branches: " + (lines[0] if lines else "not a git repository")
+    names = []
+    for name in result.stdout.splitlines():
+        name = name.strip()
+        # skip detached-HEAD lines and this tool's own temporary branches
+        if name and not name.startswith(("(", "merge-tool-tmp-", "mergetool-review-")):
+            names.append(name)
+    if not names:
+        return None, "No branches found in this repo."
+    return names, None
+
+
+def run_merge(repo, target, branches, clean, status):
+    # check inputs, clean up if asked, trial-merge; returns (result dict, error message)
+    repo = os.path.expanduser(repo.strip())
+    error = check_inputs(repo, target, branches)
+    if error:
+        return None, error
+
+    leftovers = find_leftovers(repo, branches)
+    if leftovers and not clean:
+        return None, (
+            f"A review copy from an earlier run still exists for: {', '.join(leftovers)}. "
+            "It may contain a fix someone started. Ticking 'Clean up previous review "
+            "worktrees' will delete it and run fresh."
+        )
+    cleaned = None
+    if clean:
+        status.update(label="Cleaning up old review copies…")
+        cleaned = ", ".join(remove_leftovers(repo, leftovers)) or "nothing to clean"
+
+    status.update(label="Inspecting branches…")
+    data = understand_branches(repo, target, branches)
+    # the branches are merged as one chain, so progress can't be reported per branch
+    status.update(label=f"Merging {len(branches)} branches…")
+    conflicts = sort_conflicts(repo, target, branches, data)
+    return {"data": data, "conflicts": conflicts, "target": target, "cleaned": cleaned}, None
+
+
+def short_error(e):
+    # first line of git's message if there is one, else just the error type
+    stderr = getattr(e, "stderr", None)
+    if stderr and stderr.strip():
+        return stderr.strip().splitlines()[0]
+    return type(e).__name__
+
+
+def show_sidebar():
+    # returns (repo, target, branches to merge, clean, run clicked)
     with st.sidebar:
         repo = st.text_input("Repo path")
-        target = st.text_input("Target branch", value="main")
-        names = st.text_area("Branch names (one per line)")
+        if st.button("Load branches"):
+            names, error = load_branches(repo)
+            if error:
+                st.error(error)
+            else:
+                st.session_state["loaded"] = {"repo": repo.strip(), "names": names}
+                # forget picks made for a previous repo
+                st.session_state.pop("target", None)
+                st.session_state.pop("to_merge", None)
+
+        loaded = st.session_state.get("loaded")
+        ready = bool(loaded) and loaded["repo"] == repo.strip()
+        if loaded and not ready:
+            st.caption("Repo path changed — load branches again.")
+        names = loaded["names"] if ready else []
+
+        index = (names.index("main") if "main" in names else 0) if names else None
+        target = st.selectbox("Target branch", names, index=index, key="target", disabled=not ready)
+        options = [n for n in names if n != target]
+        # drop picks that are no longer on offer (e.g. the new target)
+        st.session_state["to_merge"] = [b for b in st.session_state.get("to_merge", []) if b in options]
+        branches = st.multiselect("Branches to merge", options, key="to_merge", disabled=not ready)
+
         clean = st.checkbox(
             "Clean up previous review worktrees",
             help="Review copies from earlier runs may contain a fix someone started. "
             "Ticking this deletes them and runs fresh.",
         )
-        run = st.button("Run")
+        run = st.button("Run", type="primary", width="stretch", disabled=not ready)
+    return repo, target, branches, clean, run
 
-    if not run:
-        st.info("Fill in the sidebar and press Run.")
+
+def main():
+    st.set_page_config(page_title="Merge tool", page_icon=None, layout="wide")
+    st.title("Merge tool")
+    st.caption("Trial-merges branches into a target and shows which ones conflict and need a person.")
+
+    repo, target, branches, clean, run = show_sidebar()
+
+    if run:
+        with st.status("Merging…") as status:
+            try:
+                result, error = run_merge(repo, target, branches, clean, status)
+            except Exception as e:
+                result, error = None, f"Merge failed: {short_error(e)}"
+            status.update(label="Run failed" if error else "Run finished", state="error" if error else "complete")
+        if error:
+            st.error(error)
+            return
+        # keep the results so button clicks (Ask AI) don't lose them on rerun
+        st.session_state["last_run"] = result
+        # answers cached for an earlier run no longer match the new worktrees
+        for key in [k for k in st.session_state if k.startswith(("ai:", "res:", "view:", "editing:", "text:", "qa:", "q:"))]:
+            del st.session_state[key]
+        st.toast("Run finished")
+
+    last = st.session_state.get("last_run")
+    if not last:
+        st.info("Load the repo's branches in the sidebar, pick a target and branches, then press Run.")
         return
 
-    repo = os.path.expanduser(repo.strip())
-    target = target.strip()
-    branches = [line.strip() for line in names.splitlines() if line.strip()]
-
-    error = check_inputs(repo, target, branches)
-    if error:
-        st.error(error)
-        return
-
-    leftovers = find_leftovers(repo, branches)
-    if leftovers and not clean:
-        st.error(
-            f"A review copy from an earlier run still exists for: {', '.join(leftovers)}. "
-            "It may contain a fix someone started. Ticking 'Clean up previous review "
-            "worktrees' will delete it and run fresh."
-        )
-        return
-    if clean:
-        removed = remove_leftovers(repo, leftovers)
-        st.write("Cleaned up: " + (", ".join(removed) or "nothing to clean"))
-
-    with st.spinner("Inspecting and trial-merging branches..."):
-        data = understand_branches(repo, target, branches)
-        conflicts = sort_conflicts(repo, target, branches, data)
-
-    statuses = [status_of(files) for files in conflicts.values()]
-    st.write(
-        f"**{statuses.count('clean')}** clean, "
-        f"**{statuses.count('auto-fixed')}** auto-fixed, "
-        f"**{statuses.count('needs human')}** needs human, "
-        f"**{statuses.count('skipped')}** skipped"
-    )
-
-    st.subheader("Branch overview")
-    show_overview(data)
-    st.subheader("Merge results")
-    show_results(conflicts)
-    show_branch_details(conflicts)
+    show_metrics(last["conflicts"])
+    conflicts, overview = st.tabs(["Conflicts", "Overview"])
+    with conflicts:
+        show_conflicts(last["conflicts"], last["target"])
+    with overview:
+        if last["cleaned"]:
+            st.caption(f"Cleaned up: {last['cleaned']}")
+        st.subheader("Branch overview")
+        show_overview(last["data"])
+        st.subheader("Merge results")
+        show_results(last["conflicts"])
 
 
 main()

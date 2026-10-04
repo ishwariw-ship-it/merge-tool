@@ -1,7 +1,12 @@
+import os
+import sys
+
+# repo root on the path, so the top-level modules import when run as python3 tests/<file>.py
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import json
 
 from merge_tool import COMBINE_SAFE_FILES
-import os
 
 # real conflict log from mimic-LLM-service (staging branch), copied in place by path
 CONFLICTS_PATH = "/Users/ishwariwakchaure/Documents/mimic-LLM-service/merge-tool/conflicts.jsonl"

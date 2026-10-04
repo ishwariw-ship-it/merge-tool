@@ -1,7 +1,12 @@
 import os
+import sys
+
+# repo root on the path, so the top-level modules import when run as python3 tests/<file>.py
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import subprocess
 
-from ai_resolve import explain_conflict
+from ai_resolve import ask_question, explain_conflict
 
 REPO = os.path.expanduser("~/Documents/merge-tool-demo/repo")
 FILE = "notes.txt"
@@ -34,3 +39,14 @@ def main():
 
 
 main()
+
+answer = ask_question(
+    "what breaks if I keep only branchD's version?",
+    FILE,
+    show("main", FILE),
+    show("branchD", FILE),
+    show("branchE", FILE),
+    "branchD",
+    "branchE",
+)
+print(f"--- ask_question\n{answer}")

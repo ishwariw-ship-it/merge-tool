@@ -1,3 +1,9 @@
+import os
+import sys
+
+# repo root on the path, so the top-level modules import when run as python3 tests/<file>.py
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import json
 import subprocess
 
@@ -55,6 +61,7 @@ def main():
     ran = 0
     ok_count = 0
     same_count = 0
+    passed_count = 0
 
     # results file is regenerated on every run
     with open(CONFLICTS_PATH) as f, open(RESULTS_PATH, "w") as out:
@@ -98,6 +105,10 @@ def main():
             )
             same_count += same
 
+            # a merge passes only if the model gave one and no check found a problem
+            checks = result.get("checks", [])
+            passed_count += bool(result["ok"] and result.get("merged") and not checks)
+
             record = {
                 "id": row["id"],
                 "file": row["file"],
@@ -106,6 +117,9 @@ def main():
                 "risk_theirs": result.get("risk_theirs"),
                 "merged": result.get("merged"),
                 "confidence": result.get("confidence"),
+                "recommend": result.get("recommend", ""),
+                "port_from_other": result.get("port_from_other", []),
+                "checks": checks,
                 "ok": result["ok"],
                 "raw_text": result.get("raw_text"),
                 "actual_resolution": row.get("resolution"),
@@ -116,8 +130,8 @@ def main():
             out.write(json.dumps(record) + "\n")
 
     print(
-        f"{ran} ran, {ok_count} returned ok, {same_count} same as actual. "
-        f"Results in {RESULTS_PATH}"
+        f"{ran} ran, {ok_count} returned ok, {passed_count} passed all checks, "
+        f"{same_count} same as actual. Results in {RESULTS_PATH}"
     )
 
 

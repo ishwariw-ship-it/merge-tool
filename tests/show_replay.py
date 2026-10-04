@@ -26,9 +26,12 @@ def render(row):
             tofile="actual (staging)",
         )
     )
+    checks = row.get("checks") or []
+    port = row.get("port_from_other") or []
     parts = [
         f"# {row['id']} - {row['file']}",
         f"**Confidence:** {row.get('confidence')}  \n**ok:** {row.get('ok')}",
+        "**Checks:** " + ("; ".join(checks) if checks else "passed"),
         f"## Explanation\n{row.get('explanation')}",
         f"## Risk if we keep ours\n{row.get('risk_ours')}",
         f"## Risk if we keep theirs\n{row.get('risk_theirs')}",
@@ -36,6 +39,10 @@ def render(row):
         f"## ACTUAL (staging)\n{fence(actual)}",
         f"## Diff (model vs actual)\n{fence((diff or '(no differences)').rstrip())}",
     ]
+    if row.get("recommend"):
+        parts.insert(6, f"## Recommended base\n{row['recommend']}")
+    if port:
+        parts.insert(7 if row.get("recommend") else 6, "## Worth porting from the other side\n" + "\n".join(f"- {item}" for item in port))
     if not row.get("ok"):
         parts.insert(2, f"## Error\n{row.get('raw_text')}")
     return "\n\n".join(parts) + "\n"
