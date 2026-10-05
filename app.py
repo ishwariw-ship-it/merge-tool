@@ -534,9 +534,8 @@ def show_sidebar():
                 st.error(error)
             else:
                 st.session_state["loaded"] = {"repo": repo.strip(), "names": names}
-                # forget picks made for a previous repo
-                st.session_state.pop("target", None)
-                st.session_state.pop("to_merge", None)
+                # new widget keys per load: picks for a previous repo are forgotten
+                st.session_state["load_id"] = st.session_state.get("load_id", 0) + 1
 
         loaded = st.session_state.get("loaded")
         ready = bool(loaded) and loaded["repo"] == repo.strip()
@@ -544,12 +543,17 @@ def show_sidebar():
             st.caption("Repo path changed — load branches again.")
         names = loaded["names"] if ready else []
 
+        # the widget keys stay the same between loads, so the picks stay in session state
+        load_id = st.session_state.get("load_id", 0)
         index = (names.index("main") if "main" in names else 0) if names else None
-        target = st.selectbox("Target branch", names, index=index, key="target", disabled=not ready)
+        target = st.selectbox("Target branch", names, index=index, key=f"target:{load_id}", disabled=not ready)
         options = [n for n in names if n != target]
+        picks_key = f"to_merge:{load_id}"
         # drop picks that are no longer on offer (e.g. the new target)
-        st.session_state["to_merge"] = [b for b in st.session_state.get("to_merge", []) if b in options]
-        branches = st.multiselect("Branches to merge", options, key="to_merge", disabled=not ready)
+        picks = st.session_state.get(picks_key, [])
+        if any(b not in options for b in picks):
+            st.session_state[picks_key] = [b for b in picks if b in options]
+        branches = st.multiselect("Branches to merge", options, key=picks_key, disabled=not ready)
 
         clean = st.checkbox(
             "Clean up previous review worktrees",

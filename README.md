@@ -1,74 +1,80 @@
 # merge-tool
 
-A small script for scoping out a merge before you do it. It looks at a set of
-branches against a target branch, does a trial merge in a throwaway worktree
-(never touching your real branches), sorts any conflicts into two buckets —
-`machine` (safe to auto-resolve) and `human` (needs a person to look at it) —
-and auto-resolves a branch's conflicts when every single one of them is
-machine-safe.
+Trial-merges a set of branches into a target branch, each in a throwaway git worktree.
+It reports which branches merge cleanly and which conflict, and fixes the conflicts that are safe for a machine.
+The rest are left for a person, with an optional AI explanation. Your existing branches are not changed.
 
-## What it does
+## Files
 
-1. **understand_branches** — for each branch, checks whether it shares
-   history with the target (`git merge-base`), what files it touches, and
-   where its changed files overlap with other branches' changed files.
-2. **sort_conflicts** — sets up a temporary git worktree at the target's tip
-   and merges each branch into it one at a time (`git merge --no-ff
-   --no-commit`). Clean merges get committed so later branches are checked
-   against the combined result. Branches with no shared history are skipped.
-3. **bucket_conflict** — for each conflicted file, decides `machine` if it's
-   one of a small set of config files that are safe to combine
-   (`.env.example`, `.gitignore`, `README.md`) or if both sides made the
-   identical change, otherwise `human`.
-4. **Auto-resolve, all-or-nothing** — if every conflicted file in a branch's
-   merge attempt is `machine`, the tool fixes them all (combines config
-   files' lines, or takes either side when the content is identical) and
-   commits the merge. If even one file is `human`, nothing is applied and
-   the whole merge is aborted — never a half-resolved merge.
+- `merge_tool.py` - the core logic and the command line: branch inspection, trial merge, conflict sorting.
+- `app.py` - the Streamlit app.
+- `ai_resolve.py` - the AI helper: `explain_conflict` asks the model about a conflict, `check_merged` sanity-checks its proposed file.
+- `requirements.txt` - Python packages.
+- `tests/test_replay.py` - replays the conflict-sorting rule against a recorded conflict log.
+- `tests/test_ai_resolve.py` - one AI call on the `notes.txt` conflict in the demo repo.
+- `tests/test_ai_replay.py` - runs the AI on every conflict in the log that needs a person, writes `ai_replay_results.jsonl`.
+- `tests/show_replay.py` - turns `ai_replay_results.jsonl` into one markdown file per conflict in `replay_review/`.
 
-The worktree and any temp branches are always cleaned up, even on error.
+`branches.json`, `ai_replay_results.jsonl` and `replay_review/` are generated and git-ignored.
 
-## How to run it
+## Setup
+
+```
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+Create a `.env` file in the repo root:
+
+```
+OPENAI_API_KEY=your key
+OPENAI_MODEL=gpt-4o-mini
+```
+
+`OPENAI_MODEL` is optional (default `gpt-4o-mini`). `OPENAI_BASE_URL` is also read if set.
+Only the AI features need the key.
+
+## Run
+
+App:
+
+```
+streamlit run app.py
+```
+
+Enter the repo path, press "Load branches", pick the target and the branches to merge, then press Run.
+
+Command line (no AI):
 
 ```
 python3 merge_tool.py <repo> <target> <branch> [<branch> ...] [-o branches.json]
 ```
 
-Example:
+It prints one report line per branch and writes the branch inspection to `branches.json`.
+
+## Tests
+
+Run from the repo root.
 
 ```
-python3 merge_tool.py /path/to/repo main feat/a feat/b feat/c
+python3 tests/test_replay.py       # no API calls
+python3 tests/test_ai_resolve.py   # one API call
+python3 tests/test_ai_replay.py    # about ten API calls
+python3 tests/show_replay.py       # reads ai_replay_results.jsonl, writes replay_review/
 ```
 
-## What it outputs
+The tests read fixed paths on this machine: the conflict log in `~/Documents/mimic-LLM-service/merge-tool/`, the repo `~/Documents/mimic-LLM-service`, and the demo repo `~/Documents/merge-tool-demo/repo`.
 
-- **branches.json** (path set with `-o`, default `branches.json`) — the full
-  `understand_branches` result: base commit, shares_history, files touched,
-  and overlap, keyed by branch name.
-- A printed report on stdout from `sort_conflicts`: for each branch, either
-  `clean`, `skipped (no shared history)`, or one line per conflicted file
-  with its bucket (`machine`/`human`), whether it was `applied`, and a short
-  reason. This report is not currently written to a file, just printed —
-  there's no `report.jsonl` yet.
+## Statuses
 
-## Test result
+- **clean** - the branch merged with no conflicts.
+- **auto-fixed** - it had conflicts, but every one was safe for a machine (a config file where both sides can be combined, or both sides made the same change). They were fixed and the merge committed.
+- **needs human** - at least one conflicted file needs a person. Machine-safe files are already fixed. The rest still contain conflict markers.
+- **skipped** - the branch shares no history with the target, so it was not merged.
 
-`test_replay.py` replays the bucketing rule against a real conflict log
-(`conflicts.jsonl` from the `mimic-LLM-service` repo's `staging` branch, 14
-recorded conflicts from an actual merge) and compares the tool's predicted
-bucket against what actually happened (`needs_human`).
+## Review worktrees
 
-Result: **12 of 14 matched.** The 2 that didn't were both cases where the
-tool predicted `human` but the conflict was actually resolved without one:
+A branch that needs a person keeps its worktree. It lives in the system temp directory (`merge_tool_<random>/wt`) on a branch named `mergetool-review-<branch>`. The app shows the path under each conflicted branch.
 
-- `tests/test_character_turn.py` — combined both sides' tests, reusing a
-  resolution pattern that had already been reviewed once.
-- `tests/test_track_b_retrieval_gate.py` — kept one side's version and only
-  touched an import path.
-
-In both cases a person still made the call at the time; the tool just isn't
-aware of "we've resolved this exact shape before" or "only an import path
-differs." Its rule set only knows two safe patterns (named config files,
-identical content) and defaults to `human` for everything else, so it erred
-toward flagging things as needing a person rather than auto-resolving
-something it shouldn't have. No case went the other way.
+If a review worktree from an earlier run exists for a selected branch, the app stops with a message instead of running. Tick "Clean up previous review worktrees" to remove the old worktree and branch and run fresh. A worktree with uncommitted edits is not removed: it is kept with a warning, so finish or discard those edits first. The command line has no cleanup option; use `git worktree remove` and `git branch -D`.
