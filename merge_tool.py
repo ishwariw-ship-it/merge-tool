@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import uuid
 
 
 def git(repo, *args, check=False):
@@ -110,11 +111,60 @@ def conflict_diff(worktree, path):
     return "".join(lines)
 
 
+def fatal_line(stderr):
+    # the "fatal:" or "error:" line of git's message, else the last non-empty line
+    lines = [l.strip() for l in stderr.splitlines() if l.strip()]
+    for line in lines:
+        if line.startswith(("fatal:", "error:")):
+            return line
+    return lines[-1] if lines else ""
+
+
+def snapshot_path(worktree):
+    # where the snapshot lives: inside this worktree's own git dir
+    path = git(worktree, "rev-parse", "--git-path", "mergetool-snapshot").stdout.strip()
+    return os.path.join(worktree, path)
+
+
+def snapshot_text(worktree):
+    # git status plus a hash of every file it lists, to tell edited worktrees from untouched ones
+    status = git(worktree, "status", "--porcelain")
+    paths = [e[3:] for e in git(worktree, "status", "--porcelain", "-z").stdout.split("\0") if e]
+    lines = [status.stdout]
+    for path in paths:
+        if os.path.exists(os.path.join(worktree, path)):
+            lines.append(f"{path}\t{git(worktree, 'hash-object', '--', path).stdout.strip()}\n")
+        else:
+            lines.append(f"{path}\tmissing\n")
+    return "".join(lines)
+
+
+def save_snapshot(worktree):
+    # temp file, then rename; if it fails there is no snapshot and the worktree is treated as edited
+    path = snapshot_path(worktree)
+    try:
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".snapshot-")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(snapshot_text(worktree))
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def is_untouched(worktree):
+    # True only if a snapshot exists and the worktree still matches it
+    try:
+        with open(snapshot_path(worktree), encoding="utf-8") as fh:
+            return fh.read() == snapshot_text(worktree)
+    except OSError:
+        return False
+
+
 def new_chain_worktree(repo, start_point, tag):
     # a fresh throwaway worktree + branch, checked out at start_point
     tmp_dir = tempfile.mkdtemp(prefix="merge_tool_")
     worktree = os.path.join(tmp_dir, "wt")
-    branch_name = f"merge-tool-tmp-{os.getpid()}-{tag}"
+    branch_name = f"merge-tool-tmp-{uuid.uuid4().hex[:8]}-{tag}"
     git(repo, "worktree", "add", "-b", branch_name, worktree, start_point, check=True)
     return tmp_dir, worktree, branch_name
 
@@ -168,7 +218,10 @@ def sort_conflicts(repo, target, branches, branch_info):
                 continue
 
             # some files still need a person: leave this worktree as-is for review, don't commit
-            git(worktree, "branch", "-m", f"mergetool-review-{branch}")
+            renamed = git(worktree, "branch", "-m", f"mergetool-review-{branch}")
+            if renamed.returncode != 0:
+                raise RuntimeError(fatal_line(renamed.stderr) or "could not rename the review branch")
+            save_snapshot(worktree)
 
             report = []
             for e in entries:

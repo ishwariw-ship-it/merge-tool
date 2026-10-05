@@ -6,7 +6,7 @@ import tempfile
 import pandas as pd
 import streamlit as st
 
-from merge_tool import sort_conflicts, understand_branches
+from merge_tool import fatal_line, is_untouched, sort_conflicts, understand_branches
 
 COLORS = {
     "clean": "green",
@@ -56,28 +56,25 @@ def find_leftovers(repo, branches):
 
 
 def remove_leftovers(repo, leftovers):
-    # delete the old worktrees and branches, return a list of what was removed
-    removed = []
+    # delete old review worktrees and branches that nobody touched, plus orphaned temp branches
+    # returns (what was removed, review branches kept because of edits, other problems)
+    removed, edited, problems = [], [], []
     kept = set()
     for review, path in leftovers.items():
         if not path:
             continue
-        # any output means the person edited files there: keep worktree and branch
-        status = git(path, "status", "--porcelain")
-        if status.returncode != 0:
-            st.warning(f"Could not check {review}, not removed: {status.stderr.strip()}")
+        # edited, or no snapshot to compare with: keep worktree and branch
+        if not is_untouched(path):
+            edited.append(review)
             kept.add(review)
-        elif status.stdout.strip():
-            st.warning(f"{review} has unsaved edits, not removed — finish or discard them first.")
+            continue
+        # --force is needed: an untouched conflicted merge still counts as dirty to git
+        result = git(repo, "worktree", "remove", "--force", path)
+        if result.returncode != 0:
+            problems.append(f"Could not remove {review}: {fatal_line(result.stderr)}")
             kept.add(review)
         else:
-            # no --force: git itself refuses if the worktree is somehow dirty
-            result = git(repo, "worktree", "remove", path)
-            if result.returncode != 0:
-                st.warning(f"Could not remove {review}: {result.stderr.strip()}")
-                kept.add(review)
-            else:
-                removed.append(f"worktree {path}")
+            removed.append(f"worktree {path}")
     # forget worktrees already deleted on disk, so their branches can be deleted
     git(repo, "worktree", "prune")
     for review in leftovers:
@@ -85,7 +82,18 @@ def remove_leftovers(repo, leftovers):
             continue
         git(repo, "branch", "-D", review)
         removed.append(f"branch {review}")
-    return removed
+    # temp branches whose worktree folder is gone are throwaway
+    orphans = git(
+        repo, "branch", "--list", "merge-tool-tmp-*", "--format=%(refname:short) %(worktreepath)"
+    ).stdout.splitlines()
+    dropped = 0
+    for line in orphans:
+        name, _, worktree = line.partition(" ")
+        if name and not worktree.strip() and git(repo, "branch", "-D", name).returncode == 0:
+            dropped += 1
+    if dropped:
+        removed.append(f"{dropped} old temp branches")
+    return removed, edited, problems
 
 
 def status_of(files):
@@ -506,7 +514,16 @@ def run_merge(repo, target, branches, clean, status):
     cleaned = None
     if clean:
         status.update(label="Cleaning up old review copies…")
-        cleaned = ", ".join(remove_leftovers(repo, leftovers)) or "nothing to clean"
+        removed, edited, problems = remove_leftovers(repo, leftovers)
+        if edited:
+            names = ", ".join(b.removeprefix("mergetool-review-") for b in edited)
+            return None, (
+                f"Review copy for {names} has edits. Finish or discard them in the review "
+                "worktree, or untick those branches."
+            )
+        if problems:
+            return None, "\n".join(problems)
+        cleaned = ", ".join(removed) or "nothing to clean"
 
     status.update(label="Inspecting branches…")
     data = understand_branches(repo, target, branches)
@@ -517,11 +534,11 @@ def run_merge(repo, target, branches, clean, status):
 
 
 def short_error(e):
-    # first line of git's message if there is one, else just the error type
+    # git's fatal:/error: line, else its last line, else the error's own message or type
     stderr = getattr(e, "stderr", None)
     if stderr and stderr.strip():
-        return stderr.strip().splitlines()[0]
-    return type(e).__name__
+        return fatal_line(stderr)
+    return str(e) or type(e).__name__
 
 
 def show_sidebar():
