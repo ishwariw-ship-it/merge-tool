@@ -78,3 +78,5 @@ The tests read fixed paths on this machine: the conflict log in `~/Documents/mim
 A branch that needs a person keeps its worktree. It lives in the system temp directory (`merge_tool_<random>/wt`) on a branch named `mergetool-review-<branch>`. The app shows the path under each conflicted branch.
 
 If a review worktree from an earlier run exists for a selected branch, the app stops with a message instead of running. Tick "Clean up previous review worktrees" to remove the old worktree and branch and run fresh. A worktree with uncommitted edits is not removed: it is kept with a warning, so finish or discard those edits first. The command line has no cleanup option; use `git worktree remove` and `git branch -D`.
+
+git rerere is on (with autoupdate), so once a person resolves a conflict and commits it in the review worktree, git applies that resolution itself the next time the same conflict appears, and the file shows as auto-fixed.

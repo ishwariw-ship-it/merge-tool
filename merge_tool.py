@@ -2,6 +2,7 @@ import argparse
 import difflib
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -10,10 +11,10 @@ import uuid
 from ai_resolve import check_merged
 
 
-def git(repo, *args, check=False):
+def git(repo, *args, check=False, env=None):
     # run a git command in the repo and return the finished process
     return subprocess.run(
-        ["git", "-C", repo, *args], capture_output=True, text=True, errors="replace", check=check
+        ["git", "-C", repo, *args], capture_output=True, text=True, errors="replace", check=check, env=env
     )
 
 
@@ -229,6 +230,12 @@ def check_merge(worktree, last_good, check_cmd):
 def sort_conflicts(repo, target, branches, branch_info, check_cmd=None):
     result = {}
     ident = ["-c", "user.name=merge-tool", "-c", "user.email=merge-tool@localhost"]
+    # rerere: git itself re-applies (and with autoupdate stages) a resolution a person already made
+    # and committed for the same conflict; passed per call so the repo's own config is never touched.
+    # Its data lives in the repo's .git/rr-cache, shared by all worktrees
+    rerere = ["-c", "rerere.enabled=true", "-c", "rerere.autoupdate=true"]
+    # English output, so the "Staged '...' using previous resolution." line is always matched
+    english = {**os.environ, "LC_ALL": "C"}
 
     chain_idx = 0
     tmp_dir, worktree, temp_branch = new_chain_worktree(repo, target, chain_idx)
@@ -247,10 +254,10 @@ def sort_conflicts(repo, target, branches, branch_info, check_cmd=None):
             # the chain's current tip, in case this branch gets stuck and we need to resume from here
             last_good = git(worktree, "rev-parse", "HEAD").stdout.strip()
 
-            merge = git(worktree, "merge", "--no-ff", "--no-commit", branch)
+            merge = git(worktree, *rerere, "merge", "--no-ff", "--no-commit", branch, env=english)
             if merge.returncode == 0:
                 # clean: commit so the next branch is checked against this one too
-                commit = git(worktree, *ident, "commit", "--no-edit", "-q")
+                commit = git(worktree, *ident, *rerere, "commit", "--no-edit", "-q")
                 if commit.returncode != 0:
                     fail(branch, fatal_line(commit.stderr) or "commit failed")
                 else:
@@ -261,11 +268,17 @@ def sort_conflicts(repo, target, branches, branch_info, check_cmd=None):
 
             conflicted = git(worktree, "diff", "--name-only", "--diff-filter=U")
             conflicted_files = [l for l in conflicted.stdout.splitlines() if l]
-            if not conflicted_files:
+            # files rerere resolved are staged, so no longer unmerged, and "git rerere status" drops
+            # them once resolved: the only trace is git's own line in the merge output
+            reused = re.findall(r"^Staged '(.+)' using previous resolution\.$", merge.stdout + merge.stderr, re.M)
+            if not conflicted_files and not reused:
                 # the merge failed for some other reason than a conflict
                 fail(branch, fatal_line(merge.stderr) or "merge failed")
                 continue
-            entries = []
+            entries = [
+                {"file": path, "bucket": "machine", "comment": "resolved from a recorded resolution (rerere)", "resolution": None}
+                for path in reused
+            ]
             for path in conflicted_files:
                 bucket, comment, resolution = bucket_conflict(worktree, path)
                 entries.append(
@@ -273,9 +286,10 @@ def sort_conflicts(repo, target, branches, branch_info, check_cmd=None):
                 )
 
             # machine files always get fixed and staged, regardless of what else is left
+            # (rerere ones have no resolution to apply: git staged them already)
             try:
                 for e in entries:
-                    if e["bucket"] == "machine":
+                    if e["bucket"] == "machine" and e["resolution"]:
                         try:
                             apply_resolution(worktree, e["file"], e["resolution"])
                         except UnsafeCombine:
@@ -289,8 +303,8 @@ def sort_conflicts(repo, target, branches, branch_info, check_cmd=None):
             human_left = any(e["bucket"] == "human" for e in entries)
 
             if not human_left:
-                # everything was machine-safe: commit and keep going
-                commit = git(worktree, *ident, "commit", "--no-edit", "-q")
+                # everything was machine-safe: commit and keep going (this also records the resolution)
+                commit = git(worktree, *ident, *rerere, "commit", "--no-edit", "-q")
                 if commit.returncode != 0:
                     fail(branch, fatal_line(commit.stderr) or "commit failed")
                     continue
