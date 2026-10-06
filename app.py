@@ -627,6 +627,58 @@ def show_sidebar():
     return repo, target, branches, clean, run
 
 
+def read_proposals():
+    # entries from proposals.jsonl, oldest first; bad lines and a missing file are skipped
+    entries = []
+    try:
+        with open(PROPOSALS_LOG, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(entry, dict):
+                    entries.append(entry)
+    except OSError:
+        pass
+    return entries
+
+
+def show_stats():
+    # what the AI proposed and what people did with it
+    entries = read_proposals()
+    if not entries:
+        st.caption("No proposals logged yet.")
+        return
+    df = pd.DataFrame(entries).reindex(
+        columns=["time", "model", "repo", "branch", "file", "decision", "changed_lines", "recommend"]
+    )
+    # whole numbers, blank for a reject
+    df["changed_lines"] = pd.to_numeric(df["changed_lines"], errors="coerce").astype("Int64")
+    counts = df["decision"].value_counts()
+    tiles = st.columns(4)
+    tiles[0].metric("Proposals", len(df))
+    tiles[1].metric("Accepted", int(counts.get("accept", 0)))
+    tiles[2].metric("Edited", int(counts.get("edit", 0)))
+    tiles[3].metric("Rejected", int(counts.get("reject", 0)))
+
+    by_model = df.assign(model=df["model"].fillna("unknown")).groupby("model")["decision"]
+    table = pd.DataFrame(
+        {
+            "proposals": by_model.size(),
+            "accepted": by_model.apply(lambda d: (d == "accept").sum()),
+            "edited": by_model.apply(lambda d: (d == "edit").sum()),
+            "rejected": by_model.apply(lambda d: (d == "reject").sum()),
+        }
+    )
+    table["accepted as-is %"] = (100 * table["accepted"] / table["proposals"]).round().astype(int).astype(str) + "%"
+    st.dataframe(table, width="stretch")
+
+    st.caption("Last 20 proposals, newest first")
+    last_20 = df.drop(columns="model").tail(20).iloc[::-1]
+    st.dataframe(last_20, hide_index=True, width="stretch")
+
+
 def main():
     st.set_page_config(page_title="Merge tool", page_icon=None, layout="wide")
     st.title("Merge tool")
@@ -634,6 +686,7 @@ def main():
 
     repo, target, branches, clean, run = show_sidebar()
 
+    show_results_now = True
     if run:
         with st.status("Merging…") as status:
             try:
@@ -643,30 +696,38 @@ def main():
             status.update(label="Run failed" if error else "Run finished", state="error" if error else "complete")
         if error:
             st.error(error)
-            return
-        # keep the results so button clicks (Ask AI) don't lose them on rerun
-        st.session_state["last_run"] = result
-        # answers cached for an earlier run no longer match the new worktrees
-        for key in [k for k in st.session_state if k.startswith(("ai:", "res:", "view:", "editing:", "text:", "qa:", "q:"))]:
-            del st.session_state[key]
-        st.toast("Run finished")
+            # don't show results from an earlier run next to the error
+            show_results_now = False
+        else:
+            # keep the results so button clicks (Ask AI) don't lose them on rerun
+            st.session_state["last_run"] = result
+            # answers cached for an earlier run no longer match the new worktrees
+            for key in [k for k in st.session_state if k.startswith(("ai:", "res:", "view:", "editing:", "text:", "qa:", "q:"))]:
+                del st.session_state[key]
+            st.toast("Run finished")
 
-    last = st.session_state.get("last_run")
-    if not last:
-        st.info("Load the repo's branches in the sidebar, pick a target and branches, then press Run.")
-        return
-
-    show_metrics(last["conflicts"])
-    conflicts, overview = st.tabs(["Conflicts", "Overview"])
+    last = st.session_state.get("last_run") if show_results_now else None
+    first_run_hint = "Load the repo's branches in the sidebar, pick a target and branches, then press Run."
+    if last:
+        show_metrics(last["conflicts"])
+    conflicts, overview, stats = st.tabs(["Conflicts", "Overview", "Stats"])
     with conflicts:
-        show_conflicts(last["conflicts"], last["target"])
+        if last:
+            show_conflicts(last["conflicts"], last["target"])
+        else:
+            st.info(first_run_hint)
     with overview:
-        if last["cleaned"]:
-            st.caption(f"Cleaned up: {last['cleaned']}")
-        st.subheader("Branch overview")
-        show_overview(last["data"])
-        st.subheader("Merge results")
-        show_results(last["conflicts"])
+        if last:
+            if last["cleaned"]:
+                st.caption(f"Cleaned up: {last['cleaned']}")
+            st.subheader("Branch overview")
+            show_overview(last["data"])
+            st.subheader("Merge results")
+            show_results(last["conflicts"])
+        else:
+            st.info(first_run_hint)
+    with stats:
+        show_stats()
 
 
 main()
