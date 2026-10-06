@@ -1,7 +1,10 @@
+import difflib
+import json
 import os
 import shutil
 import subprocess
 import tempfile
+from datetime import datetime, timezone
 
 import pandas as pd
 import streamlit as st
@@ -340,6 +343,46 @@ def write_and_stage(worktree, path, text, versions, key):
     return None
 
 
+PROPOSALS_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proposals.jsonl")
+
+
+def log_proposal(entry):
+    # append one line per decision; a failed write only warns
+    try:
+        with open(PROPOSALS_LOG, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry) + "\n")
+            fh.flush()
+    except OSError as e:
+        st.warning(f"Could not write proposals.jsonl: {e.strerror}")
+
+
+def changed_line_count(before, after):
+    # number of lines that differ between two texts
+    a, b = before.splitlines(), after.splitlines()
+    ops = difflib.SequenceMatcher(None, a, b).get_opcodes()
+    return sum(max(i2 - i1, j2 - j1) for tag, i1, i2, j1, j2 in ops if tag != "equal")
+
+
+def log_decision(key, path, decision, changed_lines):
+    # key is "<branch>:<file>"; the rest comes from the session
+    result = st.session_state.get(f"ai:{key}", {})
+    loaded = st.session_state.get("loaded", {})
+    log_proposal(
+        {
+            "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "model": os.environ.get("OPENAI_MODEL") or "unknown",
+            "repo": os.path.basename(loaded.get("repo", "").rstrip("/")),
+            "target": st.session_state.get("last_run", {}).get("target", ""),
+            "branch": key[: -len(path) - 1],
+            "file": path,
+            "recommend": result.get("recommend", ""),
+            "checks": result.get("checks", []),
+            "decision": decision,
+            "changed_lines": changed_lines,
+        }
+    )
+
+
 def show_editor(worktree, path, merged, versions, key):
     # the proposed file in a text box; Save checks, writes and stages it
     text = st.text_area("Proposed file (editable)", value=merged, height=400, key=f"text:{key}")
@@ -348,6 +391,7 @@ def show_editor(worktree, path, merged, versions, key):
         if error:
             st.error(error)
         else:
+            log_decision(key, path, "edit", changed_line_count(merged, text))
             st.rerun()
 
 
@@ -368,11 +412,13 @@ def show_decision(worktree, path, result, versions, key):
         if error:
             st.error(error)
         else:
+            log_decision(key, path, "accept", 0)
             st.rerun()
     if edit.button("Edit", key=f"edit:{key}"):
         st.session_state[f"editing:{key}"] = True
     if reject.button("Reject", key=f"reject:{key}"):
         st.session_state[f"res:{key}"] = "rejected"
+        log_decision(key, path, "reject", None)
         st.rerun()
     if st.session_state.get(f"editing:{key}"):
         show_editor(worktree, path, result["merged"], versions, key)

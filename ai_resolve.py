@@ -23,7 +23,12 @@ def call_llm(prompt, json_mode=True):
 
         from openai import OpenAI
 
-        client = OpenAI(api_key=key, base_url=os.environ.get("OPENAI_BASE_URL") or None)
+        client = OpenAI(
+            api_key=key,
+            base_url=os.environ.get("OPENAI_BASE_URL") or None,
+            timeout=60,
+            max_retries=1,
+        )
         reply = client.chat.completions.create(
             model=os.environ.get("OPENAI_MODEL") or "gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],

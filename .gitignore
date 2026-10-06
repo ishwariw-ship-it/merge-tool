@@ -4,3 +4,4 @@ branches.json
 .venv/
 ai_replay_results.jsonl
 replay_review/
+proposals.jsonl
