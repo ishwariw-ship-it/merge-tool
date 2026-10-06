@@ -130,7 +130,10 @@ def explain_conflict(
     filename, base, ours, theirs, our_branch, their_branch, our_commit_msg, their_commit_msg
 ):
     # ask the model to explain one conflict and propose a merge, returns a dict
-    base, ours, theirs = trim_to_conflict(base, ours, theirs)
+    trimmed = trim_to_conflict(base, ours, theirs)
+    # an excerpt can't be written back as the whole file
+    excerpt = trimmed != (base, ours, theirs)
+    base, ours, theirs = trimmed
     # no base means both sides added the file
     add_add = not base.strip()
 
@@ -214,6 +217,7 @@ Use exactly these keys:
         # an empty merged (model not confident) has nothing to check
         # (check_merged still flags escaped text if the conversion left it that way)
         result["checks"] = check_merged(filename, merged) if merged else []
+        result["excerpt"] = excerpt
 
         result["ok"] = True
         return result
@@ -223,6 +227,7 @@ Use exactly these keys:
 
 def ask_question(question, filename, base, ours, theirs, our_branch, their_branch):
     # answer one free-form question about a conflict, returns plain text or None
+    base, ours, theirs = trim_to_conflict(base, ours, theirs)
     prompt = f"""You are helping someone resolve a git merge conflict in the file "{filename}".
 
 === BASE (common ancestor) ===

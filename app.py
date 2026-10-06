@@ -16,6 +16,7 @@ COLORS = {
     "auto-fixed": "dodgerblue",
     "needs human": "orange",
     "skipped": "grey",
+    "failed": "red",
 }
 
 
@@ -100,9 +101,11 @@ def remove_leftovers(repo, leftovers):
 
 
 def status_of(files):
-    # files is None (skipped), [] (clean) or a list of conflict entries
+    # files is None (skipped), [] (clean), {"failed": why} or a list of conflict entries
     if files is None:
         return "skipped"
+    if isinstance(files, dict):
+        return "failed"
     if not files:
         return "clean"
     if any(f["bucket"] == "human" for f in files):
@@ -115,6 +118,8 @@ def reason_of(status, files):
         return "no shared history"
     if status == "clean":
         return "merged without conflicts"
+    if status == "failed":
+        return files["failed"]
     return "; ".join(f"{f['file']}: {f['comment']}" for f in files)
 
 
@@ -150,11 +155,12 @@ def show_results(conflicts):
     rows = []
     for branch, files in conflicts.items():
         status = status_of(files)
+        names = [f["file"] for f in files] if isinstance(files, list) else []
         rows.append(
             {
                 "branch": branch,
                 "status": status,
-                "files": ", ".join(f["file"] for f in files or []) or "-",
+                "files": ", ".join(names) or "-",
                 "reason": reason_of(status, files),
             }
         )
@@ -177,7 +183,10 @@ def show_metrics(conflicts):
     # one tile per status, in a row
     statuses = [status_of(files) for files in conflicts.values()]
     tiles = [("Clean", "clean"), ("Auto-fixed", "auto-fixed"), ("Needs human", "needs human"), ("Skipped", "skipped")]
-    for column, (label, status) in zip(st.columns(4), tiles):
+    # a fifth tile only when something failed
+    if "failed" in statuses:
+        tiles.append(("Failed", "failed"))
+    for column, (label, status) in zip(st.columns(len(tiles)), tiles):
         column.metric(label, statuses.count(status))
 
 
@@ -209,7 +218,13 @@ def show_three_way(versions):
         with column:
             st.markdown(f"**{title}**")
             # add/add conflicts have no base, so a missing stage means no file on that side
-            st.code(text if text is not None else "(file did not exist)")
+            if text is None:
+                st.code("(file did not exist)")
+            elif text.count("�") > 3:
+                # undecodable bytes were replaced on read
+                st.code("(binary file)")
+            else:
+                st.code(text)
 
 
 def show_raw_markers(worktree, path):
@@ -280,6 +295,8 @@ def show_ai_result(result):
             st.info("AI did not propose a merged file — decide by hand using the explanation above.")
             return
         st.markdown("**Proposed merged file**")
+        if result.get("excerpt"):
+            st.caption("Excerpt only — the file is too long to write back. Use this as a guide and fix by hand.")
         checks = result.get("checks", [])
         if checks:
             st.error("\n".join(f"- {problem}" for problem in checks))
@@ -471,7 +488,8 @@ def show_ai_section(worktree, target, branch, path, versions):
             st.session_state[f"ai:{key}"] = ask_ai(worktree, target, branch, path, versions)
     result = st.session_state[f"ai:{key}"]
     show_ai_result(result)
-    if result.get("ok") and result.get("merged"):
+    # an excerpt is a guide only, so no Accept / Edit / Reject
+    if result.get("ok") and result.get("merged") and not result.get("excerpt"):
         show_decision(worktree, path, result, versions, key)
     show_question(path, versions, target, branch, key)
     if st.session_state.get(f"res:{key}") != "resolved" and st.button("Ask again", key=f"again:{key}"):
@@ -484,6 +502,13 @@ def show_ai_section(worktree, target, branch, path, versions):
 def show_human_file(f, target, branch):
     # one conflicted file: side-by-side / raw tabs, then the AI helper
     st.markdown(f"**`{f['file']}`** — {f['comment']}")
+    if f["comment"].startswith("binary file"):
+        # nothing to show or ask about for bytes
+        st.write(
+            "Binary file — pick one side by hand in the review worktree: "
+            f"`git checkout --ours -- {f['file']}` or `--theirs`"
+        )
+        return
     key = f"{branch}:{f['file']}"
     versions = st.session_state.get(f"view:{key}")
     if versions is None:

@@ -11,7 +11,7 @@ import uuid
 def git(repo, *args, check=False):
     # run a git command in the repo and return the finished process
     return subprocess.run(
-        ["git", "-C", repo, *args], capture_output=True, text=True, check=check
+        ["git", "-C", repo, *args], capture_output=True, text=True, errors="replace", check=check
     )
 
 
@@ -66,6 +66,11 @@ def show_side(worktree, stage, path):
 def bucket_conflict(worktree, path):
     # decide whether a conflicted file can be resolved by machine or needs a person
     # resolution says how to fix it: "combine", "take_either", or None (needs a person)
+    # numstat prints "-\t-" for a binary file (diffing the two sides: the unmerged path itself shows 0\t0)
+    numstat = git(worktree, "diff", "--numstat", f":2:{path}", f":3:{path}")
+    if numstat.returncode == 0 and numstat.stdout.startswith("-\t-"):
+        return "human", "binary file, needs a person", None
+
     if os.path.basename(path) in COMBINE_SAFE_FILES:
         return "machine", "config file, safe to combine", "combine"
 
@@ -75,27 +80,44 @@ def bucket_conflict(worktree, path):
     return "human", "both sides changed it differently, needs a person", None
 
 
-def apply_resolution(worktree, path, resolution):
-    # write the resolved content for one conflicted file and stage it
-    ours = show_side(worktree, 2, path)
+class UnsafeCombine(RuntimeError):
+    # the combined file looks wrong, so it is left for a person instead
+    pass
 
-    if resolution == "take_either":
-        content = ours
-    else:
-        # combine: ours' lines first, then theirs' lines that aren't already present
-        theirs = show_side(worktree, 3, path)
-        combined_lines = ours.splitlines()
-        for line in theirs.splitlines():
-            if line not in combined_lines:
-                combined_lines.append(line)
-        content = "\n".join(combined_lines)
-        if combined_lines:
-            content += "\n"
 
-    with open(os.path.join(worktree, path), "w") as f:
+def write_file(path, content):
+    # temp file next to the target, then rename, so a crash never leaves a half-written file
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".merge-tool-")
+    with os.fdopen(fd, "w") as f:
         f.write(content)
+    if os.path.exists(path):
+        shutil.copymode(path, tmp)
+    os.replace(tmp, path)
 
-    git(worktree, "add", path)
+
+def apply_resolution(worktree, path, resolution):
+    # write the resolved content for one conflicted file and stage it; raises if git can't combine
+    if resolution == "take_either":
+        content = show_side(worktree, 2, path)
+    else:
+        # combine: git's own union merge of the three stages (no stage 1 for add/add: empty file)
+        with tempfile.TemporaryDirectory() as tmp:
+            sides = []
+            for stage in (2, 1, 3):
+                side = os.path.join(tmp, str(stage))
+                with open(side, "w") as f:
+                    f.write(show_side(worktree, stage, path))
+                sides.append(side)
+            merged = git(worktree, "merge-file", "-p", "--union", *sides)
+        if merged.returncode != 0:
+            raise RuntimeError(f"{path}: {fatal_line(merged.stderr) or 'merge-file failed'}")
+        content = merged.stdout
+        # a union can share one closing fence between two code blocks
+        if sum(line.startswith("```") for line in content.splitlines()) % 2:
+            raise UnsafeCombine(f"{path}: code fences unbalanced after combine")
+
+    write_file(os.path.join(worktree, path), content)
+    git(worktree, "add", "--", path)
 
 
 def conflict_diff(worktree, path):
@@ -176,6 +198,11 @@ def sort_conflicts(repo, target, branches, branch_info):
     chain_idx = 0
     tmp_dir, worktree, temp_branch = new_chain_worktree(repo, target, chain_idx)
 
+    def fail(branch, message):
+        # give up on this branch only: undo its merge, record why, go on with the next
+        git(worktree, "merge", "--abort")
+        result[branch] = {"failed": message}
+
     try:
         for branch in branches:
             if not branch_info[branch]["shares_history"]:
@@ -188,12 +215,19 @@ def sort_conflicts(repo, target, branches, branch_info):
             merge = git(worktree, "merge", "--no-ff", "--no-commit", branch)
             if merge.returncode == 0:
                 # clean: commit so the next branch is checked against this one too
-                git(worktree, *ident, "commit", "--no-edit", "-q")
-                result[branch] = []
+                commit = git(worktree, *ident, "commit", "--no-edit", "-q")
+                if commit.returncode != 0:
+                    fail(branch, fatal_line(commit.stderr) or "commit failed")
+                else:
+                    result[branch] = []
                 continue
 
             conflicted = git(worktree, "diff", "--name-only", "--diff-filter=U")
             conflicted_files = [l for l in conflicted.stdout.splitlines() if l]
+            if not conflicted_files:
+                # the merge failed for some other reason than a conflict
+                fail(branch, fatal_line(merge.stderr) or "merge failed")
+                continue
             entries = []
             for path in conflicted_files:
                 bucket, comment, resolution = bucket_conflict(worktree, path)
@@ -202,15 +236,27 @@ def sort_conflicts(repo, target, branches, branch_info):
                 )
 
             # machine files always get fixed and staged, regardless of what else is left
-            for e in entries:
-                if e["bucket"] == "machine":
-                    apply_resolution(worktree, e["file"], e["resolution"])
+            try:
+                for e in entries:
+                    if e["bucket"] == "machine":
+                        try:
+                            apply_resolution(worktree, e["file"], e["resolution"])
+                        except UnsafeCombine:
+                            # leave this one file for a person; the other machine files still get applied
+                            e["bucket"] = "human"
+                            e["comment"] = "could not combine safely, needs a person"
+            except (RuntimeError, OSError) as e:
+                fail(branch, str(e))
+                continue
 
             human_left = any(e["bucket"] == "human" for e in entries)
 
             if not human_left:
                 # everything was machine-safe: commit and keep going
-                git(worktree, *ident, "commit", "--no-edit", "-q")
+                commit = git(worktree, *ident, "commit", "--no-edit", "-q")
+                if commit.returncode != 0:
+                    fail(branch, fatal_line(commit.stderr) or "commit failed")
+                    continue
                 result[branch] = [
                     {"file": e["file"], "bucket": e["bucket"], "comment": e["comment"], "applied": True}
                     for e in entries
@@ -275,6 +321,8 @@ def main():
     for branch, files in conflicts.items():
         if files is None:
             print(f"{branch}: skipped (no shared history)")
+        elif isinstance(files, dict):
+            print(f"{branch}: failed ({files['failed']})")
         elif files:
             for f in files:
                 print(
