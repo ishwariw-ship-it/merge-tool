@@ -7,6 +7,8 @@ import subprocess
 import tempfile
 import uuid
 
+from ai_resolve import check_merged
+
 
 def git(repo, *args, check=False):
     # run a git command in the repo and return the finished process
@@ -191,7 +193,40 @@ def new_chain_worktree(repo, start_point, tag):
     return tmp_dir, worktree, branch_name
 
 
-def sort_conflicts(repo, target, branches, branch_info):
+def check_merge(worktree, last_good, check_cmd):
+    # a clean merge can still be broken code: compile-check the changed .py files, then run
+    # the person's check command; returns the first problem found, or None
+    changed = git(worktree, "diff", "--name-only", last_good, "HEAD").stdout.splitlines()
+    for path in changed:
+        full = os.path.join(worktree, path)
+        if not path.endswith(".py") or not os.path.isfile(full):
+            continue
+        try:
+            with open(full, encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except OSError as e:
+            return f"{path}: {e.strerror}"
+        problems = check_merged(path, text)
+        if problems:
+            return f"{path}: {problems[0]}"
+
+    if check_cmd:
+        # no .pyc files: one from an earlier merge could hide a break in this one
+        env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+        try:
+            run = subprocess.run(
+                check_cmd, shell=True, cwd=worktree, capture_output=True, text=True, errors="replace",
+                timeout=300, env=env,
+            )
+        except subprocess.TimeoutExpired:
+            return "check command timed out (300s)"
+        if run.returncode != 0:
+            why = fatal_line(run.stderr) or fatal_line(run.stdout) or f"exit {run.returncode}"
+            return f"check command failed: {why}"
+    return None
+
+
+def sort_conflicts(repo, target, branches, branch_info, check_cmd=None):
     result = {}
     ident = ["-c", "user.name=merge-tool", "-c", "user.email=merge-tool@localhost"]
 
@@ -219,7 +254,9 @@ def sort_conflicts(repo, target, branches, branch_info):
                 if commit.returncode != 0:
                     fail(branch, fatal_line(commit.stderr) or "commit failed")
                 else:
-                    result[branch] = []
+                    # the merge stays in the chain either way; only the status changes
+                    problem = check_merge(worktree, last_good, check_cmd)
+                    result[branch] = {"broken": problem, "files": []} if problem else []
                 continue
 
             conflicted = git(worktree, "diff", "--name-only", "--diff-filter=U")
@@ -257,10 +294,12 @@ def sort_conflicts(repo, target, branches, branch_info):
                 if commit.returncode != 0:
                     fail(branch, fatal_line(commit.stderr) or "commit failed")
                     continue
-                result[branch] = [
+                files = [
                     {"file": e["file"], "bucket": e["bucket"], "comment": e["comment"], "applied": True}
                     for e in entries
                 ]
+                problem = check_merge(worktree, last_good, check_cmd)
+                result[branch] = {"broken": problem, "files": files} if problem else files
                 continue
 
             # some files still need a person: leave this worktree as-is for review, don't commit
@@ -302,6 +341,7 @@ def main():
     parser.add_argument("target")
     parser.add_argument("branches", nargs="+")
     parser.add_argument("-o", default="branches.json")
+    parser.add_argument("--check-cmd", default=None, help="shell command run in the merged copy after each clean merge")
     args = parser.parse_args()
 
     data = understand_branches(args.repo, args.target, args.branches)
@@ -317,10 +357,12 @@ def main():
         json.dump(data, f, indent=2)
 
     # stage 2: try merging each branch and report conflicts
-    conflicts = sort_conflicts(args.repo, args.target, args.branches, data)
+    conflicts = sort_conflicts(args.repo, args.target, args.branches, data, args.check_cmd)
     for branch, files in conflicts.items():
         if files is None:
             print(f"{branch}: skipped (no shared history)")
+        elif isinstance(files, dict) and "broken" in files:
+            print(f"{branch}: merged but broken ({files['broken']})")
         elif isinstance(files, dict):
             print(f"{branch}: failed ({files['failed']})")
         elif files:

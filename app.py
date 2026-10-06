@@ -17,6 +17,7 @@ COLORS = {
     "needs human": "orange",
     "skipped": "grey",
     "failed": "red",
+    "merged but broken": "red",
 }
 
 
@@ -101,11 +102,12 @@ def remove_leftovers(repo, leftovers):
 
 
 def status_of(files):
-    # files is None (skipped), [] (clean), {"failed": why} or a list of conflict entries
+    # files is None (skipped), [] (clean), {"failed": why}, {"broken": why, "files": [...]}
+    # or a list of conflict entries
     if files is None:
         return "skipped"
     if isinstance(files, dict):
-        return "failed"
+        return "merged but broken" if "broken" in files else "failed"
     if not files:
         return "clean"
     if any(f["bucket"] == "human" for f in files):
@@ -120,6 +122,8 @@ def reason_of(status, files):
         return "merged without conflicts"
     if status == "failed":
         return files["failed"]
+    if status == "merged but broken":
+        return files["broken"]
     return "; ".join(f"{f['file']}: {f['comment']}" for f in files)
 
 
@@ -155,7 +159,8 @@ def show_results(conflicts):
     rows = []
     for branch, files in conflicts.items():
         status = status_of(files)
-        names = [f["file"] for f in files] if isinstance(files, list) else []
+        entries = files.get("files", []) if isinstance(files, dict) else (files or [])
+        names = [f["file"] for f in entries]
         rows.append(
             {
                 "branch": branch,
@@ -183,9 +188,10 @@ def show_metrics(conflicts):
     # one tile per status, in a row
     statuses = [status_of(files) for files in conflicts.values()]
     tiles = [("Clean", "clean"), ("Auto-fixed", "auto-fixed"), ("Needs human", "needs human"), ("Skipped", "skipped")]
-    # a fifth tile only when something failed
-    if "failed" in statuses:
-        tiles.append(("Failed", "failed"))
+    # extra tiles only when something failed or broke
+    for label, status in (("Failed", "failed"), ("Broken", "merged but broken")):
+        if status in statuses:
+            tiles.append((label, status))
     for column, (label, status) in zip(st.columns(len(tiles)), tiles):
         column.metric(label, statuses.count(status))
 
@@ -568,7 +574,7 @@ def load_branches(repo):
     return names, None
 
 
-def run_merge(repo, target, branches, clean, status):
+def run_merge(repo, target, branches, clean, check_cmd, status):
     # check inputs, clean up if asked, trial-merge; returns (result dict, error message)
     repo = os.path.expanduser(repo.strip())
     error = check_inputs(repo, target, branches)
@@ -600,7 +606,7 @@ def run_merge(repo, target, branches, clean, status):
     data = understand_branches(repo, target, branches)
     # the branches are merged as one chain, so progress can't be reported per branch
     status.update(label=f"Merging {len(branches)} branches…")
-    conflicts = sort_conflicts(repo, target, branches, data)
+    conflicts = sort_conflicts(repo, target, branches, data, check_cmd)
     return {"data": data, "conflicts": conflicts, "target": target, "cleaned": cleaned}, None
 
 
@@ -648,8 +654,13 @@ def show_sidebar():
             help="Review copies from earlier runs may contain a fix someone started. "
             "Ticking this deletes them and runs fresh.",
         )
+        check_cmd = st.text_input(
+            "Check command (optional)",
+            help="Runs inside the merged copy after every clean merge, e.g. pytest -q tests/ or "
+            "python -c 'import mymodule'. Leave empty to only compile-check changed .py files.",
+        )
         run = st.button("Run", type="primary", width="stretch", disabled=not ready)
-    return repo, target, branches, clean, run
+    return repo, target, branches, clean, check_cmd.strip(), run
 
 
 def read_proposals():
@@ -709,13 +720,13 @@ def main():
     st.title("Merge tool")
     st.caption("Trial-merges branches into a target and shows which ones conflict and need a person.")
 
-    repo, target, branches, clean, run = show_sidebar()
+    repo, target, branches, clean, check_cmd, run = show_sidebar()
 
     show_results_now = True
     if run:
         with st.status("Merging…") as status:
             try:
-                result, error = run_merge(repo, target, branches, clean, status)
+                result, error = run_merge(repo, target, branches, clean, check_cmd, status)
             except Exception as e:
                 result, error = None, f"Merge failed: {short_error(e)}"
             status.update(label="Run failed" if error else "Run finished", state="error" if error else "complete")
