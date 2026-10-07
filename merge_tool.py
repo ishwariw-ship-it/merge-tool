@@ -185,6 +185,11 @@ def is_untouched(worktree):
         return False
 
 
+def review_branch(branch):
+    # name of the kept review branch; a remote name like origin/x can't hold the slash
+    return f"mergetool-review-{branch.replace('/', '-')}"
+
+
 def new_chain_worktree(repo, start_point, tag):
     # a fresh throwaway worktree + branch, checked out at start_point
     tmp_dir = tempfile.mkdtemp(prefix="merge_tool_")
@@ -317,7 +322,7 @@ def sort_conflicts(repo, target, branches, branch_info, check_cmd=None):
                 continue
 
             # some files still need a person: leave this worktree as-is for review, don't commit
-            renamed = git(worktree, "branch", "-m", f"mergetool-review-{branch}")
+            renamed = git(worktree, "branch", "-m", review_branch(branch))
             if renamed.returncode != 0:
                 raise RuntimeError(fatal_line(renamed.stderr) or "could not rename the review branch")
             save_snapshot(worktree)

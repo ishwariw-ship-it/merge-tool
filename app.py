@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 import pandas as pd
 import streamlit as st
 
-from merge_tool import fatal_line, is_untouched, sort_conflicts, understand_branches
+from merge_tool import fatal_line, is_untouched, review_branch, sort_conflicts, understand_branches
 
 COLORS = {
     "clean": "green",
@@ -53,7 +53,7 @@ def find_leftovers(repo, branches):
 
     leftovers = {}
     for branch in branches:
-        review = f"mergetool-review-{branch}"
+        review = review_branch(branch)
         has_branch = git(repo, "branch", "--list", review).stdout.strip()
         if has_branch or review in worktrees:
             leftovers[review] = worktrees.get(review)
@@ -528,6 +528,48 @@ def show_human_file(f, target, branch):
         show_ai_section(f["review_path"], target, branch, f["file"], versions)
 
 
+def show_push(branch, worktree):
+    # Push the committed review branch to origin; never the target branch
+    if git(worktree, "remote", "get-url", "origin").returncode != 0:
+        st.caption("No remote named origin")
+        return
+    review = review_branch(branch)
+    if st.session_state.get(f"push:{branch}"):
+        st.success(f"Pushed {review} to origin")
+        return
+    wanted = st.checkbox(f"Push {review} to origin", key=f"pushbox:{branch}")
+    if st.button("Push", key=f"pushbtn:{branch}", disabled=not wanted):
+        result = git(worktree, "push", "-u", "origin", review)
+        if result.returncode != 0:
+            st.error(f"Push failed: {fatal_line(result.stderr)}")
+            return
+        st.session_state[f"push:{branch}"] = True
+        st.rerun()
+
+
+def show_commit(branch, worktree, keys):
+    # Commit once every human file of the branch is resolved; only ever in the review worktree
+    done = st.session_state.get(f"commit:{branch}")
+    if done:
+        st.success(f"Committed {done} in the review worktree")
+        show_push(branch, worktree)
+        return
+    if not all(st.session_state.get(f"res:{k}") == "resolved" for k in keys):
+        return
+    reviewed = st.checkbox("I have reviewed the merged files", key=f"reviewed:{branch}")
+    if st.button("Commit merge", key=f"commitbtn:{branch}", disabled=not reviewed):
+        if not is_review_worktree(worktree):
+            st.error("This is not a review worktree, nothing committed.")
+            return
+        message = f"Merge branch '{branch}' into {st.session_state['last_run']['target']}"
+        result = git(worktree, "-c", "user.name=merge-tool", "-c", "user.email=merge-tool@localhost", "commit", "-q", "-m", message)
+        if result.returncode != 0:
+            st.error(f"Commit failed: {fatal_line(result.stderr)}")
+            return
+        st.session_state[f"commit:{branch}"] = git(worktree, "rev-parse", "--short", "HEAD").stdout.strip()
+        st.rerun()
+
+
 def show_branch_card(branch, files, target):
     # one bordered card per conflicted branch
     status = status_of(files)
@@ -542,6 +584,8 @@ def show_branch_card(branch, files, target):
             st.caption(f"Review worktree kept at: {human[0]['review_path']}")
         for f in human:
             show_human_file(f, target, branch)
+        if human:
+            show_commit(branch, human[0]["review_path"], [f"{branch}:{f['file']}" for f in human])
 
 
 def show_conflicts(conflicts, target):
@@ -555,19 +599,27 @@ def show_conflicts(conflicts, target):
 
 
 def load_branches(repo):
-    # local branch names for the repo, returns (names, error)
+    # local and origin/* branch names for the repo, returns (names, error)
     repo = os.path.expanduser(repo.strip())
     if not os.path.isdir(repo):
         return None, f"Repo path does not exist: {repo}"
-    result = git(repo, "branch", "--format=%(refname:short)")
+    # a fresh view of the remote; with no remote (or offline) the local branches still work
+    if not git(repo, "remote").stdout.strip():
+        st.warning("No remote configured; using local branches only.")
+    else:
+        fetch = git(repo, "fetch", "--prune")
+        if fetch.returncode != 0:
+            st.warning(f"Could not fetch ({fatal_line(fetch.stderr)}); using local branches only.")
+    result = git(repo, "branch", "-a", "--format=%(refname:short)")
     if result.returncode != 0:
         lines = result.stderr.strip().splitlines()
         return None, "Could not list branches: " + (lines[0] if lines else "not a git repository")
     names = []
     for name in result.stdout.splitlines():
         name = name.strip()
-        # skip detached-HEAD lines and this tool's own temporary branches
-        if name and not name.startswith(("(", "merge-tool-tmp-", "mergetool-review-")):
+        # skip detached-HEAD lines, origin/HEAD and this tool's own branches (local or pushed)
+        own = name.removeprefix("origin/").startswith(("merge-tool-tmp-", "mergetool-review-"))
+        if name and not name.startswith("(") and name not in ("origin", "origin/HEAD") and not own:
             names.append(name)
     if not names:
         return None, "No branches found in this repo."
@@ -639,7 +691,8 @@ def show_sidebar():
 
         # the widget keys stay the same between loads, so the picks stay in session state
         load_id = st.session_state.get("load_id", 0)
-        index = (names.index("main") if "main" in names else 0) if names else None
+        # target defaults to main, or origin/main when there is no local main
+        index = next((names.index(n) for n in ("main", "origin/main") if n in names), 0) if names else None
         target = st.selectbox("Target branch", names, index=index, key=f"target:{load_id}", disabled=not ready)
         options = [n for n in names if n != target]
         picks_key = f"to_merge:{load_id}"
@@ -738,7 +791,7 @@ def main():
             # keep the results so button clicks (Ask AI) don't lose them on rerun
             st.session_state["last_run"] = result
             # answers cached for an earlier run no longer match the new worktrees
-            for key in [k for k in st.session_state if k.startswith(("ai:", "res:", "view:", "editing:", "text:", "qa:", "q:"))]:
+            for key in [k for k in st.session_state if k.startswith(("ai:", "res:", "view:", "editing:", "text:", "qa:", "q:", "commit:", "reviewed:", "push:", "pushbox:"))]:
                 del st.session_state[key]
             st.toast("Run finished")
 
