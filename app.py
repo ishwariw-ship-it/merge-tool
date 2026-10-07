@@ -40,8 +40,8 @@ def check_inputs(repo, target, branches):
     return None
 
 
-def find_leftovers(repo, branches):
-    # find old mergetool-review-<branch> branches/worktrees
+def find_reviews(repo):
+    # every mergetool-review-* branch in the repo
     # returns {review branch: worktree path, or None if it has no worktree}
     worktrees = {}
     path = None
@@ -50,14 +50,14 @@ def find_leftovers(repo, branches):
             path = line[len("worktree "):]
         elif line.startswith("branch refs/heads/"):
             worktrees[line[len("branch refs/heads/"):]] = path
+    names = git(repo, "branch", "--list", "mergetool-review-*", "--format=%(refname:short)").stdout.split()
+    return {name: worktrees.get(name) for name in names}
 
-    leftovers = {}
-    for branch in branches:
-        review = review_branch(branch)
-        has_branch = git(repo, "branch", "--list", review).stdout.strip()
-        if has_branch or review in worktrees:
-            leftovers[review] = worktrees.get(review)
-    return leftovers
+
+def find_leftovers(repo, branches):
+    # the review branches/worktrees of the selected branches only
+    wanted = {review_branch(b) for b in branches}
+    return {name: path for name, path in find_reviews(repo).items() if name in wanted}
 
 
 def remove_leftovers(repo, leftovers):
@@ -713,7 +713,34 @@ def show_sidebar():
             "python -c 'import mymodule'. Leave empty to only compile-check changed .py files.",
         )
         run = st.button("Run", type="primary", width="stretch", disabled=not ready)
+        if st.button("Remove review worktrees", disabled=not ready):
+            st.session_state["cleanup_open"] = True
+        if ready and st.session_state.get("cleanup_open"):
+            show_cleanup(os.path.expanduser(repo.strip()))
     return repo, target, branches, clean, check_cmd.strip(), run
+
+
+def show_cleanup(repo):
+    # every review worktree with its state; Delete removes the untouched ones only
+    done = st.session_state.pop("cleanup_done", None)
+    if done:
+        st.info(done)
+    reviews = find_reviews(repo)
+    if not reviews:
+        st.caption("No review worktrees.")
+        return
+    for name, path in reviews.items():
+        state = "no worktree" if not path else "untouched" if is_untouched(path) else "edited"
+        st.write(f"{name}: {state}")
+    st.caption("Edited ones are never deleted.")
+    sure = st.checkbox("Delete the untouched ones", key="cleanup_sure")
+    if st.button("Delete", key="cleanup_delete", disabled=not sure):
+        removed, edited, problems = remove_leftovers(repo, reviews)
+        st.session_state["cleanup_done"] = (
+            f"Removed: {', '.join(removed) or 'nothing'}. Kept (edited): {', '.join(edited) or 'none'}."
+            + (" " + " ".join(problems) if problems else "")
+        )
+        st.rerun()
 
 
 def read_proposals():
